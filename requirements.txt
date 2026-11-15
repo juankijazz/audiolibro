@@ -12,6 +12,7 @@ s3tokenizer
 transformers==5.2.0
 diffusers==0.29.0
 resemble-perth
+setuptools<81
 conformer==0.3.2
 safetensors==0.5.3
 omegaconf

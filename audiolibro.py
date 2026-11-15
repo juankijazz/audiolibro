@@ -599,10 +599,13 @@ def cargar_chatterbox(dispositivo, log=print):
     s3gen = S3Gen()
     try:
         s3_p = bajar(es, "s3gen_v3.safetensors", "Descargando el decodificador de voz V3 (1,1 GB)...")
-        s3gen.load_state_dict(load_file(str(s3_p)))
+        r = s3gen.load_state_dict(load_file(str(s3_p)), strict=False)
+        if r.missing_keys or r.unexpected_keys:
+            raise RuntimeError(f"faltan {len(r.missing_keys)} {r.missing_keys[:4]}; "
+                               f"sobran {len(r.unexpected_keys)} {r.unexpected_keys[:4]}")
         log("Decodificador V3 cargado.")
     except Exception as e:
-        log(f"Aviso: el decodificador V3 no encaja ({type(e).__name__}); se usa el estándar.")
+        log(f"Aviso: el decodificador V3 no encaja ({type(e).__name__}: {str(e)[:400]}); se usa el estándar.")
         s3gen = S3Gen()
         s3_p = bajar(base, "s3gen.pt", "Descargando el decodificador estándar (1 GB)...")
         s3gen.load_state_dict(torch.load(str(s3_p), map_location=mapa, weights_only=True))
