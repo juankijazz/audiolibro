@@ -5,6 +5,7 @@ import pymupdf
 
 
 def crear(carpeta):
+    os.makedirs(carpeta, exist_ok=True)
 
     # ---------------- EPUB ----------------
     b = epub.EpubBook()
