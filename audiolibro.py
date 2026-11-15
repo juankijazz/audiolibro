@@ -887,7 +887,17 @@ class SintVoxtral:
         self.url = buscar_servidor_unsloth()
         if self.url:
             self.modo = "api"
-            self.modelo = _modelo_api(self.url, self.clave)
+            if not self.clave:
+                raise RuntimeError(
+                    "Unsloth pide una clave API. En Unsloth Studio ve a Settings > API, crea una clave "
+                    "(empieza por sk-unsloth-) y pégala en el campo 'Clave API' de Audiolibro.")
+            try:
+                self.modelo = _modelo_api(self.url, self.clave)
+            except RuntimeError as e:
+                if "401" in str(e):
+                    raise RuntimeError("Unsloth rechaza la clave API (401). Crea otra en Settings > API y "
+                                       "pégala de nuevo en 'Clave API'.")
+                raise
             self.dispositivo = "cuda"
             log(f"Voxtral vía Unsloth ({self.url}), modelo {self.modelo}, voz {self.nombre_voz}")
             return
