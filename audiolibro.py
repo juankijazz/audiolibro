@@ -853,6 +853,30 @@ def _modelo_api(url, clave):
     raise RuntimeError("Unsloth no tiene ningún modelo cargado: carga Voxtral TTS en Unsloth Studio.")
 
 
+def voces_servidor(url, clave):
+    """Voces que expone el servidor: [(id, nombre)]."""
+    datos, _ = _http(url + "/v1/audio/voices", clave, timeout=10)
+    j = json.loads(datos.decode("utf-8"))
+    if isinstance(j, dict):
+        j = next((j[k] for k in ("voices", "data", "items") if isinstance(j.get(k), list)), [])
+    salida = []
+    for v in j:
+        if isinstance(v, str):
+            salida.append((v, v))
+        elif isinstance(v, dict):
+            vid = v.get("id") or v.get("voice_id") or v.get("name")
+            if vid:
+                nombre = str(v.get("name") or vid)
+                idioma = v.get("language") or v.get("lang") or ""
+                salida.append((str(vid), nombre + (f"  ({idioma})" if idioma else "")))
+    return salida
+
+
+def es_voz_espanola(vid, nombre=""):
+    t = f"{vid} {nombre}".lower()
+    return bool(re.search(r"(^|[\W_])es([\W_]|$)|spanish|espa[nñ]|castellano|spain", t))
+
+
 def sondear_voxtral(log=print):
     """Muestra lo que ve la aplicacion en el servidor (para diagnosticar)."""
     aj = cargar_ajustes()
@@ -893,6 +917,7 @@ class SintVoxtral:
                     "(empieza por sk-unsloth-) y pégala en el campo 'Clave API' de Audiolibro.")
             try:
                 self.modelo = _modelo_api(self.url, self.clave)
+                self._elegir_voz()
             except RuntimeError as e:
                 if "401" in str(e):
                     raise RuntimeError("Unsloth rechaza la clave API (401). Crea otra en Settings > API y "
@@ -912,6 +937,29 @@ class SintVoxtral:
         log(f"Voxtral: {Path(self.gguf).name if self.gguf else 'auto'} con {Path(self.exe).name}, "
             f"voz {self.nombre_voz}")
 
+    def _elegir_voz(self):
+        """Comprueba que la voz existe en el servidor (si no, Voxtral usaria una voz inglesa por defecto)."""
+        self.con_idioma = True
+        try:
+            voces = voces_servidor(self.url, self.clave)
+        except Exception:
+            voces = []
+        if not voces:
+            return
+        quiero = self.nombre_voz.lower()
+        for vid, nombre in voces:
+            if quiero in (vid.lower(), nombre.split("  (")[0].lower()):
+                self.nombre_voz = vid
+                return
+        esp = [v for v in voces if es_voz_espanola(*v)]
+        if esp:
+            self.log(f"La voz '{self.nombre_voz}' no existe en tu servidor; se usa '{esp[0][0]}'.")
+            self.nombre_voz = esp[0][0]
+            return
+        raise RuntimeError(
+            f"La voz '{self.nombre_voz}' no existe en tu servidor de Unsloth y no hay ninguna voz en español. "
+            f"Voces disponibles: {', '.join(v[0] for v in voces[:20])}. Elige una en la lista de voces.")
+
     def _leer(self, datos):
         import numpy as np
         import soundfile as sf
@@ -926,9 +974,18 @@ class SintVoxtral:
 
     def _sintetizar(self, texto, semilla):
         if self.modo == "api":
-            datos, tipo = _http(self.url + "/v1/audio/speech", self.clave,
-                                {"model": self.modelo, "input": texto, "voice": self.nombre_voz,
-                                 "response_format": "wav"}, timeout=900)
+            cuerpo = {"model": self.modelo, "input": texto, "voice": self.nombre_voz, "response_format": "wav"}
+            if getattr(self, "con_idioma", True):
+                cuerpo["language"] = "Spanish"
+            try:
+                datos, tipo = _http(self.url + "/v1/audio/speech", self.clave, cuerpo, timeout=900)
+            except RuntimeError as e:
+                if "language" in cuerpo and ("422" in str(e) or "400" in str(e)):
+                    self.con_idioma = False                   # este servidor no admite el campo: se reintenta sin él
+                    cuerpo.pop("language")
+                    datos, tipo = _http(self.url + "/v1/audio/speech", self.clave, cuerpo, timeout=900)
+                else:
+                    raise
             if "json" in tipo.lower():
                 raise RuntimeError(f"Respuesta inesperada de Unsloth: {datos[:300].decode('utf-8', 'replace')}")
             return self._leer(datos)
@@ -1282,10 +1339,11 @@ def gui():
         pass
 
     # Paleta calida: crema de fondo, indigo profundo en la cabecera y naranja como acento.
-    C = {"fondo": "#FBF6EF", "tarjeta": "#FFFFFF", "borde": "#E8DDCE", "indigo": "#3A2E5D",
-         "indigo2": "#5B4A8F", "acento": "#E8743B", "acento_h": "#D1622C", "acento_p": "#B95524",
-         "texto": "#2B2438", "suave": "#7A7088", "claro": "#D9CFF0", "fila": "#FAF3E8",
-         "gris": "#EDE5D9"}
+    C = {"fondo": "#F6F0E4", "tarjeta": "#FFFEFA", "borde": "#E6DAC3", "indigo": "#0F4C81",
+         "indigo2": "#2E7DB5", "acento": "#1B9AA6", "acento_h": "#15838E", "acento_p": "#106C75",
+         "boton": "#D9693A", "boton_h": "#C25A2E", "boton_p": "#A84D26", "sol": "#E9A23B",
+         "texto": "#16344B", "suave": "#6B7F8C", "claro": "#CDE6F0", "fila": "#F8F2E6",
+         "gris": "#ECE3D0"}
     FUENTE = "Segoe UI"
     MARCA_SI, MARCA_NO = "✔", "○"
 
@@ -1325,7 +1383,7 @@ def gui():
                      font=(FUENTE, 22, "bold")).pack(side="left", padx=(24, 12), pady=(14, 14))
             tk.Label(cab, text="Convierte tus libros en audio con voces naturales, en tu propio PC",
                      bg=C["indigo"], fg=C["claro"], font=(FUENTE, 11)).pack(side="left", pady=(20, 0))
-            tk.Frame(root, bg=C["acento"], height=4).pack(fill="x")
+            tk.Frame(root, bg=C["sol"], height=4).pack(fill="x")
 
             cuerpo = tk.Frame(root, bg=C["fondo"])
             cuerpo.pack(fill="both", expand=True, padx=20, pady=(14, 16))
@@ -1400,13 +1458,18 @@ def gui():
             self.v_vx_url = tk.StringVar(value=aj.get("vx_url") or "http://127.0.0.1:8888")
             self.v_vx_clave = tk.StringVar(value=aj.get("vx_clave", ""))
             self.fila_vx = []
-            for fila, (txt, var, oculto) in enumerate((("Servidor Unsloth", self.v_vx_url, ""),
-                                                       ("Clave API", self.v_vx_clave, "\u2022")), 3):
-                e1 = ttk.Label(t3, text=txt, style="Card.TLabel")
-                e2 = ttk.Entry(t3, textvariable=var, show=oculto)
-                e1.grid(row=fila, column=0, sticky="w")
-                e2.grid(row=fila, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=3)
-                self.fila_vx.append((e1, e2))
+            e1 = ttk.Label(t3, text="Servidor Unsloth", style="Card.TLabel")
+            e2 = ttk.Entry(t3, textvariable=self.v_vx_url)
+            e3 = ttk.Button(t3, text="Cargar voces", style="Suave.TButton", command=self.cargar_voces_vx)
+            e1.grid(row=3, column=0, sticky="w")
+            e2.grid(row=3, column=1, sticky="ew", padx=(10, 6), pady=3)
+            e3.grid(row=3, column=2)
+            self.fila_vx.append((e1, e2, e3))
+            f1 = ttk.Label(t3, text="Clave API", style="Card.TLabel")
+            f2 = ttk.Entry(t3, textvariable=self.v_vx_clave, show="\u2022")
+            f1.grid(row=4, column=0, sticky="w")
+            f2.grid(row=4, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=3)
+            self.fila_vx.append((f1, f2))
             ttk.Label(t3, textvariable=self.v_info, style="Nota.TLabel", wraplength=470,
                       justify="left").grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
@@ -1498,10 +1561,10 @@ def gui():
             s.map("Suave.TButton", background=[("disabled", "#F3EEE6"), ("pressed", "#D8CDBC"),
                                                ("active", "#E2D8C8")],
                   foreground=[("disabled", "#B3AAA0")])
-            s.configure("Accion.TButton", background=C["acento"], foreground="white", borderwidth=0,
+            s.configure("Accion.TButton", background=C["boton"], foreground="white", borderwidth=0,
                         focusthickness=0, padding=(26, 12), font=(FUENTE, 12, "bold"))
-            s.map("Accion.TButton", background=[("disabled", "#EFC3AB"), ("pressed", C["acento_p"]),
-                                                ("active", C["acento_h"])],
+            s.map("Accion.TButton", background=[("disabled", "#EBC8B4"), ("pressed", C["boton_p"]),
+                                                ("active", C["boton_h"])],
                   foreground=[("disabled", "#FFFFFF")])
             s.configure("Card.TCheckbutton", background=C["tarjeta"], foreground=C["texto"], padding=3)
             s.map("Card.TCheckbutton", background=[("active", C["tarjeta"])],
@@ -1566,6 +1629,8 @@ def gui():
             self.cb_voz.config(values=vals)
             self.v_voz.set(vals[0])
             self.cambia_voz()
+            if vx and self.v_vx_clave.get().strip():
+                self.cargar_voces_vx()
 
         def cambia_voz(self):
             propia = self.voz() == "cb:propia"
@@ -1578,6 +1643,22 @@ def gui():
                                            filetypes=[("Audio", "*.wav *.mp3 *.flac *.m4a *.ogg"), ("Todos", "*.*")])
             if r:
                 self.v_ref.set(r)
+
+        def cargar_voces_vx(self):
+            """Pide a Unsloth sus voces y las ofrece en la lista (la española, preseleccionada)."""
+            self.guardar_vx()
+            self.v_estado.set("Consultando las voces de Unsloth...")
+
+            def trabajo():
+                try:
+                    clave = self.v_vx_clave.get().strip()
+                    if not clave:
+                        raise RuntimeError("Pega primero la clave API de Unsloth (Settings > API).")
+                    url = (self.v_vx_url.get().strip() or buscar_servidor_unsloth()).rstrip("/")
+                    self.q.put(("vx_voces", voces_servidor(url, clave)))
+                except Exception as e:
+                    self.q.put(("vx_error", str(e)))
+            threading.Thread(target=trabajo, daemon=True).start()
 
         def guardar_vx(self):
             if self.motor() == "voxtral":
@@ -1719,6 +1800,20 @@ def gui():
                     elif k == "prog":
                         self.pb["value"] = m[1] * 1000
                         self.v_estado.set(m[2])
+                    elif k == "vx_voces":
+                        if m[1] and self.motor() == "voxtral":
+                            vals = [f"vx:{vid}  |  {nombre}" for vid, nombre in m[1]]
+                            self.cb_voz.config(values=vals)
+                            esp = [v for v, (vid, nom) in zip(vals, m[1]) if es_voz_espanola(vid, nom)]
+                            self.v_voz.set((esp or vals)[0])
+                            self.v_estado.set(f"{len(vals)} voces cargadas desde Unsloth"
+                                              + (f" ({len(esp)} en español)." if esp else "; ninguna es española."))
+                            self.escribir("Voces de Unsloth: " + ", ".join(v[0] for v in m[1]))
+                        else:
+                            self.v_estado.set("Unsloth no devolvió ninguna voz.")
+                    elif k == "vx_error":
+                        self.v_estado.set("No se pudieron cargar las voces.")
+                        self.escribir(m[1])
                     elif k == "gpu":
                         self.gpu_ok = m[1]
                         self.v_gpu_txt.set(m[2])

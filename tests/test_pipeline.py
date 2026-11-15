@@ -155,7 +155,11 @@ class Pipeline(unittest.TestCase):
                 pass
 
             def do_GET(self):
-                cuerpo = _json.dumps({"data": [{"id": "otro"}, {"id": "Voxtral-4B-TTS-2603-GGUF"}]}).encode()
+                if "voices" in self.path:
+                    obj = {"data": [{"id": "casual_male"}, {"id": "es_female", "language": "es"}]}
+                else:
+                    obj = {"data": [{"id": "otro"}, {"id": "Voxtral-4B-TTS-2603-GGUF"}]}
+                cuerpo = _json.dumps(obj).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -189,6 +193,12 @@ class Pipeline(unittest.TestCase):
                 self.assertGreater(len(a) / A.SAMPLE_RATE, 2.0)          # remuestreado a 24 kHz
                 self.assertEqual(pedidos[0][0], "Bearer sk-unsloth-prueba")
                 self.assertEqual(pedidos[0][1]["voice"], "es_female")
+                self.assertEqual(pedidos[0][1]["language"], "Spanish")
+                # una voz que no existe en el servidor se sustituye por la española disponible
+                s2 = A.Sintetizador("vx:es_male", 1.0, True, lambda *_: None)
+                self.assertEqual(s2.nombre_voz, "es_female")
+                self.assertEqual([v for v, _ in A.voces_servidor(s.url, s.clave)], ["casual_male", "es_female"])
+                self.assertTrue(A.es_voz_espanola("es_female") and not A.es_voz_espanola("casual_male"))
                 self.assertEqual(pedidos[0][1]["response_format"], "wav")
             finally:
                 srv.shutdown()
