@@ -1,0 +1,10 @@
+kokoro>=0.9.4
+misaki>=0.9.4
+espeakng-loader
+soundfile
+numpy
+ebooklib
+beautifulsoup4
+lxml
+pymupdf
+imageio-ffmpeg

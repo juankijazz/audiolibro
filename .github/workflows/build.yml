@@ -1,0 +1,87 @@
+name: Compilar Audiolibro
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  probar:
+    name: Pruebas y sintesis real (CPU)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Instalar dependencias (PyTorch CPU)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyflakes
+      - name: Analisis estatico
+        run: python -m pyflakes audiolibro.py bootstrap.py tests
+      - name: Pruebas con voz simulada
+        run: python tests/test_pipeline.py
+      - name: Crear libros de muestra
+        run: python tests/make_samples.py muestras
+      - name: Sintesis REAL con Kokoro (capitulo 1 del EPUB de prueba, CPU)
+        run: python audiolibro.py muestras/prueba.epub --cpu --capitulos 3 --salida salida_real
+      - name: Diagnostico
+        run: python audiolibro.py --diagnostico
+        continue-on-error: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: muestra-voz-real
+          path: salida_real/*.m4b
+
+  compilar:
+    name: Compilar Audiolibro.exe y probarlo de extremo a extremo
+    needs: probar
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compilar con PyInstaller
+        run: |
+          pip install pyinstaller
+          pyinstaller --noconfirm --onefile --windowed --name Audiolibro --add-data "audiolibro.py;." --add-data "requirements.txt;." bootstrap.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Audiolibro-exe
+          path: dist/Audiolibro.exe
+      - name: Prueba E2E - el exe instala todo y la app sintetiza
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath dist\Audiolibro.exe -ArgumentList '--sin-gui' -Wait -PassThru
+          Write-Host "codigo de salida del instalador: $($p.ExitCode)"
+          Get-Content "$env:LOCALAPPDATA\Audiolibro\setup.log" -Tail 80
+          if ($p.ExitCode -ne 0) { exit 1 }
+          $py = "$env:LOCALAPPDATA\Audiolibro\venv\Scripts\python.exe"
+          & $py tests\make_samples.py muestras
+          & $py "$env:LOCALAPPDATA\Audiolibro\app\audiolibro.py" muestras\prueba.epub --cpu --capitulos 3 --salida salida_exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          if (-not (Test-Path salida_exe\*.m4b)) { Write-Host "No se genero el M4B"; exit 1 }
+
+  publicar:
+    name: Publicar Audiolibro.exe en la release "latest"
+    needs: compilar
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Audiolibro-exe
+          path: dist
+      - name: Crear release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" || true
+          gh release create latest dist/Audiolibro.exe --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Audiolibro.exe (ultima version)" \
+            --notes "Doble clic en Audiolibro.exe. La primera vez instala todo lo necesario (varios GB con GPU NVIDIA); despues abre la aplicacion directamente."

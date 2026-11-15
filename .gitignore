@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+venv/
+build/
+dist/
+*.spec
+salida*/
+muestras/
+tests/data/
+audiolibro_error.log
