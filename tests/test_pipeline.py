@@ -1,4 +1,5 @@
 """Pruebas del pipeline con voz simulada (no necesitan GPU ni modelo)."""
+import os
 import re
 import subprocess
 import sys
@@ -83,6 +84,16 @@ class Pipeline(unittest.TestCase):
                            text=True, errors="replace")
         self.assertEqual(len(re.findall(r"Chapter #0:\d", r.stderr)), 3)
         self.assertFalse((salida / "El Hidalgo de Prueba_temporal").exists())
+
+    def test_salida_relativa(self):
+        libro = A.leer_txt(self.d / "prueba.txt")
+        antes = os.getcwd()
+        os.chdir(self.d)
+        try:
+            dest = A.convertir(libro, A.Config(salida="rel_salida", falso=True), lambda s: None)
+        finally:
+            os.chdir(antes)
+        self.assertTrue(Path(dest).exists())
 
     def test_mp3_por_capitulo(self):
         libro = A.leer_txt(self.d / "prueba.txt")

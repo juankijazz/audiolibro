@@ -562,7 +562,7 @@ def convertir(libro, cfg, log=print, progreso=None, cancel=None):
     caps = [(i, c) for i, c in enumerate(libro.capitulos) if c.seleccionado]
     if not caps:
         raise ValueError("No hay capitulos seleccionados.")
-    out_dir = Path(cfg.salida)
+    out_dir = Path(cfg.salida).resolve()      # ruta absoluta: ffmpeg resuelve la lista concat relativa a su carpeta
     out_dir.mkdir(parents=True, exist_ok=True)
     base = nombre_seguro(libro.titulo) or "audiolibro"
     trabajo = out_dir / (base + "_temporal")
