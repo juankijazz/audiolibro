@@ -877,6 +877,30 @@ def es_voz_espanola(vid, nombre=""):
     return bool(re.search(r"(^|[\W_])es([\W_]|$)|spanish|espa[nñ]|castellano|spain", t))
 
 
+def diagnostico_voxtral(url, clave):
+    """Texto con lo que responde el servidor: voces en bruto y campos admitidos por /v1/audio/speech."""
+    lineas = []
+    try:
+        datos, _ = _http(url + "/v1/audio/voices", clave, timeout=10)
+        lineas.append("GET /v1/audio/voices -> " + datos.decode("utf-8", "replace")[:700])
+    except Exception as e:
+        lineas.append(f"GET /v1/audio/voices -> {e}")
+    try:
+        datos, _ = _http(url + "/openapi.json", clave, timeout=10)
+        api = json.loads(datos.decode("utf-8"))
+        cuerpo = api.get("paths", {}).get("/v1/audio/speech", {}).get("post", {}).get("requestBody", {})
+        esquema = (cuerpo.get("content", {}).get("application/json", {}) or {}).get("schema", {})
+        ref = esquema.get("$ref", "")
+        if ref:
+            esquema = api.get("components", {}).get("schemas", {}).get(ref.split("/")[-1], esquema)
+        props = esquema.get("properties", {})
+        lineas.append("Campos de /v1/audio/speech: " + (", ".join(
+            f"{k} ({v.get('type', '?')})" for k, v in props.items()) or json.dumps(cuerpo)[:600]))
+    except Exception as e:
+        lineas.append(f"/openapi.json -> {e}")
+    return "\n".join(lineas)
+
+
 def sondear_voxtral(log=print):
     """Muestra lo que ve la aplicacion en el servidor (para diagnosticar)."""
     aj = cargar_ajustes()
@@ -886,12 +910,12 @@ def sondear_voxtral(log=print):
         log("No encuentro el servidor de Unsloth (probé 127.0.0.1:8888 y :8000).")
         return 1
     log(f"Servidor: {url}  (clave {'sí' if clave else 'NO configurada'})")
-    for ruta in ("/v1/models", "/v1/audio/voices"):
-        try:
-            datos, _ = _http(url + ruta, clave, timeout=10)
-            log(f"{ruta}: {datos.decode('utf-8', 'replace')[:1500]}")
-        except Exception as e:
-            log(f"{ruta}: {e}")
+    try:
+        datos, _ = _http(url + "/v1/models", clave, timeout=10)
+        log(f"/v1/models: {datos.decode('utf-8', 'replace')[:1500]}")
+    except Exception as e:
+        log(f"/v1/models: {e}")
+    log(diagnostico_voxtral(url, clave))
     return 0
 
 
@@ -1655,7 +1679,10 @@ def gui():
                     if not clave:
                         raise RuntimeError("Pega primero la clave API de Unsloth (Settings > API).")
                     url = (self.v_vx_url.get().strip() or buscar_servidor_unsloth()).rstrip("/")
-                    self.q.put(("vx_voces", voces_servidor(url, clave)))
+                    voces = voces_servidor(url, clave)
+                    self.q.put(("vx_voces", voces))
+                    if not voces:
+                        self.q.put(("vx_diag", diagnostico_voxtral(url, clave)))
                 except Exception as e:
                     self.q.put(("vx_error", str(e)))
             threading.Thread(target=trabajo, daemon=True).start()
@@ -1810,7 +1837,9 @@ def gui():
                                               + (f" ({len(esp)} en español)." if esp else "; ninguna es española."))
                             self.escribir("Voces de Unsloth: " + ", ".join(v[0] for v in m[1]))
                         else:
-                            self.v_estado.set("Unsloth no devolvió ninguna voz.")
+                            self.v_estado.set("Unsloth no lista voces propias: se usan las predefinidas de Voxtral.")
+                    elif k == "vx_diag":
+                        self.escribir(m[1])
                     elif k == "vx_error":
                         self.v_estado.set("No se pudieron cargar las voces.")
                         self.escribir(m[1])
