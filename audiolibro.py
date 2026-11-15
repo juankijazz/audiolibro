@@ -600,8 +600,9 @@ def cargar_chatterbox(dispositivo, log=print):
     try:
         s3_p = bajar(es, "s3gen_v3.safetensors", "Descargando el decodificador de voz V3 (1,1 GB)...")
         r = s3gen.load_state_dict(load_file(str(s3_p)), strict=False)
-        if r.missing_keys or r.unexpected_keys:
-            raise RuntimeError(f"faltan {len(r.missing_keys)} {r.missing_keys[:4]}; "
+        faltan = [k for k in r.missing_keys if not k.startswith("tokenizer.")]   # buffers que se calculan solos
+        if faltan or r.unexpected_keys:
+            raise RuntimeError(f"faltan {len(faltan)} {faltan[:4]}; "
                                f"sobran {len(r.unexpected_keys)} {r.unexpected_keys[:4]}")
         log("Decodificador V3 cargado.")
     except Exception as e:
