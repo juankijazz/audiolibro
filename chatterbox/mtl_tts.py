@@ -353,3 +353,53 @@ class ChatterboxMultilingualTTS:
 
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
         return torch.from_numpy(watermarked_wav).unsqueeze(0)
+
+    def generate_lote(
+        self,
+        textos,
+        language_id,
+        exaggeration=0.5,
+        cfg_weight=0.5,
+        temperature=0.8,
+        repetition_penalty=1.2,
+        min_p=0.05,
+        top_p=1.0,
+        limite_tokens=None,
+    ):
+        """Sintetiza varios textos a la vez (misma voz). Devuelve [(wav float32 numpy, completo)]."""
+        from .models.t3.lote import inferencia_lote
+        if self.conds is None:
+            raise AssertionError("Hay que llamar antes a prepare_conditionals")
+        if float(exaggeration) != float(self.conds.t3.emotion_adv[0, 0, 0].item()):
+            _cond: T3Cond = self.conds.t3
+            self.conds.t3 = T3Cond(
+                speaker_emb=_cond.speaker_emb,
+                cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
+                emotion_adv=exaggeration * torch.ones(1, 1, 1),
+            ).to(device=self.device)
+        sot = self.t3.hp.start_text_token
+        eot = self.t3.hp.stop_text_token
+        toks, limites = [], []
+        for t in textos:
+            t = punc_norm(t)
+            x = self.tokenizer.text_to_tokens(t, language_id=language_id.lower() if language_id else None)
+            x = F.pad(F.pad(x.to(self.device), (1, 0), value=sot), (0, 1), value=eot)[0]
+            toks.append(x)
+            limites.append(limite_tokens(t) if limite_tokens else 1000)
+        with torch.inference_mode():
+            tokens, completos = inferencia_lote(
+                self.t3, self.conds.t3, toks, limites, temperature=temperature, top_p=top_p, min_p=min_p,
+                repetition_penalty=repetition_penalty, cfg_weight=cfg_weight)
+            res = []
+            for tk, ok in zip(tokens, completos):
+                tk = drop_invalid_tokens(tk.to(self.device))
+                if tk.numel() == 0:
+                    res.append((torch.zeros(0).numpy(), False))
+                    continue
+                wav, _ = self.s3gen.inference(speech_tokens=tk, ref_dict=self.conds.gen)
+                wav = wav.squeeze(0).detach().cpu().numpy()
+                n = max(1, int(tk.shape[-1]) - 1)
+                wav = wav[: n * (S3GEN_SR // S3_TOKEN_RATE)]
+                wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
+                res.append((wav.astype("float32"), ok))
+        return res

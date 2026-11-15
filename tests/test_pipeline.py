@@ -141,6 +141,103 @@ class Pipeline(unittest.TestCase):
         pausas = [v for k, v in pl if k == "s"]
         self.assertTrue(all(0.1 <= p <= 1.5 for p in pausas))
 
+    def test_voxtral_via_servidor_unsloth_falso(self):
+        """Voxtral por la API /v1/audio/speech de Unsloth (servidor simulado)."""
+        import http.server
+        import io
+        import json as _json
+        import numpy as np
+        import soundfile as sf
+        pedidos = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                cuerpo = _json.dumps({"data": [{"id": "otro"}, {"id": "Voxtral-4B-TTS-2603-GGUF"}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(cuerpo)
+
+            def do_POST(self):
+                n = int(self.headers["Content-Length"])
+                pedidos.append((self.headers.get("Authorization"), _json.loads(self.rfile.read(n))))
+                t = pedidos[-1][1]["input"]
+                dur = max(1.0, len(t) / 15.0)
+                x = (0.2 * np.sin(2 * np.pi * 220 * np.arange(int(16000 * dur)) / 16000)).astype("float32")
+                b = io.BytesIO()
+                sf.write(b, x, 16000, format="WAV")
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/wav")
+                self.end_headers()
+                self.wfile.write(b.getvalue())
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        old = {k: os.environ.get(k) for k in ("AUDIOLIBRO_VOXTRAL_URL", "AUDIOLIBRO_DATOS", "UNSLOTH_API_KEY")}
+        with tempfile.TemporaryDirectory() as d:
+            os.environ.update(AUDIOLIBRO_VOXTRAL_URL=f"http://127.0.0.1:{srv.server_port}",
+                              AUDIOLIBRO_DATOS=d, UNSLOTH_API_KEY="sk-unsloth-prueba")
+            try:
+                self.assertEqual(A.motor_de("vx:es_female"), "voxtral")
+                A.guardar_ajustes(vx_modelo=None)
+                s = A.Sintetizador("vx:es_female", 1.0, True, lambda *_: None)
+                a = s("Hola, esto es una prueba de la voz de Voxtral en español.")
+                self.assertEqual(s.modelo, "Voxtral-4B-TTS-2603-GGUF")
+                self.assertGreater(len(a) / A.SAMPLE_RATE, 2.0)          # remuestreado a 24 kHz
+                self.assertEqual(pedidos[0][0], "Bearer sk-unsloth-prueba")
+                self.assertEqual(pedidos[0][1]["voice"], "es_female")
+                self.assertEqual(pedidos[0][1]["response_format"], "wav")
+            finally:
+                srv.shutdown()
+                for k, v in old.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+
+    def test_motor_por_lotes_conserva_el_orden(self):
+        """Con un motor por lotes, el audio final queda en el mismo orden que el texto."""
+        import numpy as np
+        import soundfile as sf
+        llamadas = []
+
+        class Lotes:
+            lote_max = 3
+            vacios = 0
+            reintentos = 0
+            dispositivo = "falso"
+
+            def __call__(self, t):
+                return A._tono(t)
+
+            def lote(self, textos, cancel=None):
+                llamadas.append(len(textos))
+                return [A._tono(t) for t in reversed(textos[::-1])]
+
+        libro = A.leer_txt(self.d / "prueba.txt")
+        orig = A.Sintetizador
+        try:
+            A.Sintetizador = lambda *a, **k: Lotes()
+            cfg = A.Config(voz="cb:f1", salida=str(self.d / "lotes"), formato="mp3", conservar_temporal=True)
+            A.convertir(libro, cfg, lambda s: None)
+            ref = A.Config(voz="cb:f1", salida=str(self.d / "sin_lotes"), formato="mp3", conservar_temporal=True)
+            A.Sintetizador = lambda *a, **k: type("U", (Lotes,), {"lote_max": 1})()
+            A.convertir(libro, ref, lambda s: None)
+        finally:
+            A.Sintetizador = orig
+        self.assertTrue(llamadas and max(llamadas) <= max(8, 3 * 3))
+        a = sorted((self.d / "lotes").rglob("cap_*.wav"))
+        b = sorted((self.d / "sin_lotes").rglob("cap_*.wav"))
+        self.assertEqual(len(a), len(b))
+        for x, y in zip(a, b):
+            xa, _ = sf.read(str(x))
+            ya, _ = sf.read(str(y))
+            self.assertEqual(len(xa), len(ya))
+            self.assertTrue(np.allclose(xa, ya, atol=1e-3))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

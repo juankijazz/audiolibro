@@ -25,6 +25,8 @@ jobs:
         run: python -m pyflakes audiolibro.py bootstrap.py tests
       - name: Pruebas con voz simulada
         run: python tests/test_pipeline.py
+      - name: Pruebas del modo por lotes (modelo diminuto)
+        run: python tests/test_lote.py
       - name: Crear libros de muestra
         run: python tests/make_samples.py muestras
       - name: Sintesis REAL con Kokoro (capitulo 1 del EPUB de prueba, CPU)
@@ -57,6 +59,10 @@ jobs:
         timeout-minutes: 40
         run: |
           python audiolibro.py --muestra muestras_voz/chatterbox_es_f1.wav --voz cb:f1 --cpu
+      - name: Modo por lotes REAL con Chatterbox (CPU, 3 trozos a la vez)
+        timeout-minutes: 40
+        run: |
+          python tests/ci_lote.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -61,13 +61,22 @@ VOCES = {
 MOTORES = {
     "kokoro": "Rápido - Kokoro (CPU o GPU)",
     "chatterbox": "Alta calidad - Chatterbox España (GPU)",
+    "voxtral": "Máxima naturalidad - Voxtral de Mistral (GPU)",
 }
+VX_VOCES = {
+    "vx:es_female": "Español - mujer (es_female)",
+    "vx:es_male": "Español - hombre (es_male)",
+    "vx:neutral_female": "Neutra - mujer (neutral_female)",
+    "vx:neutral_male": "Neutra - hombre (neutral_male)",
+}
+VX_MAX_CHARS = 400       # trozos algo mas largos: menos llamadas y mejor entonacion
 REF_URL = "https://storage.googleapis.com/chatterbox-demo-samples/mtl-v3-single-language-prompts/es-es/"
 CB_VOCES = {
     "cb:f1": {"etiqueta": "España (castellano) - mujer", "archivo": "es_es_f1.wav"},
     "cb:propia": {"etiqueta": "Mi propia voz de referencia (elige un audio)", "archivo": None},
 }
 CB_EXAG, CB_CFG, CB_TEMP = 0.45, 0.5, 0.75   # narracion serena y estable
+CB_LOTE = 8              # trozos que Chatterbox sintetiza a la vez en la GPU (AUDIOLIBRO_LOTE lo cambia)
 FORMATOS = {
     "m4b": "M4B - un archivo con capitulos (recomendado)",
     "mp3": "MP3 - un solo archivo",
@@ -189,12 +198,12 @@ def trocear(texto, max_chars=MAX_CHARS):
     return [x.replace("\x01", ".") for x in trozos]
 
 
-def plan_capitulo(cap, leer_titulo):
+def plan_capitulo(cap, leer_titulo, max_chars=MAX_CHARS):
     """Lista de pasos: ('t', texto) = hablar, ('s', segundos) = silencio."""
     pl = []
     if leer_titulo and cap.titulo and re.search(r"\w", cap.titulo):
         tit = limpiar_para_tts(cap.titulo).rstrip(".:") + "."
-        for tz in trocear(tit):
+        for tz in trocear(tit, max_chars):
             pl.append(("t", tz))
         pl.append(("s", 1.2))
     for par in cap.parrafos:
@@ -204,7 +213,7 @@ def plan_capitulo(cap, leer_titulo):
         txt = limpiar_para_tts(par)
         if not txt or not re.search(r"\w", txt):
             continue
-        for tz in trocear(txt):
+        for tz in trocear(txt, max_chars):
             pl.append(("t", tz))
             fin = re.search(r"[.!?…:»\"”)]$", tz.strip())
             pl.append(("s", 0.35 if fin else 0.18))
@@ -525,7 +534,32 @@ DIR_MODELOS = _dir_datos() / "modelos"
 
 
 def motor_de(voz):
-    return "chatterbox" if str(voz).startswith("cb:") else "kokoro"
+    voz = str(voz)
+    if voz.startswith("cb:"):
+        return "chatterbox"
+    return "voxtral" if voz.startswith("vx:") else "kokoro"
+
+
+# Ajustes que se recuerdan entre sesiones (rutas del motor Voxtral).
+def _f_ajustes():
+    return _dir_datos() / "ajustes.json"
+
+
+def cargar_ajustes():
+    try:
+        return json.loads(_f_ajustes().read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def guardar_ajustes(**cambios):
+    a = cargar_ajustes()
+    a.update({k: v for k, v in cambios.items() if v is not None})
+    try:
+        _f_ajustes().parent.mkdir(parents=True, exist_ok=True)
+        _f_ajustes().write_text(json.dumps(a, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def descargar(url, dest):
@@ -622,6 +656,7 @@ class SintChatterbox:
         self.dispositivo = "falso"
         self.vacios = 0
         self.reintentos = 0
+        self.lote_max = 1
         if falso:
             return
         import torch
@@ -637,7 +672,10 @@ class SintChatterbox:
         self.m = _PIPES[clave]
         self.m.prepare_conditionals(ref, exaggeration=CB_EXAG)
         nombre = torch.cuda.get_device_name(0) if self.dispositivo == "cuda" else "CPU"
-        log(f"Sintetizando en: {self.dispositivo.upper()} ({nombre}) - motor de alta calidad")
+        env = os.environ.get("AUDIOLIBRO_LOTE")
+        self.lote_max = int(env) if env else (CB_LOTE if self.dispositivo == "cuda" else 1)
+        log(f"Sintetizando en: {self.dispositivo.upper()} ({nombre}) - motor de alta calidad"
+            + (f", {self.lote_max} trozos a la vez" if self.lote_max > 1 else ""))
 
     def __call__(self, texto):
         import numpy as np
@@ -663,10 +701,268 @@ class SintChatterbox:
             return np.zeros(0, dtype="float32")
         return mejor
 
+    @staticmethod
+    def _limite_tokens(t):
+        """Tope de tokens de voz (25 por segundo) segun el texto: corta las alucinaciones largas."""
+        return min(1000, int(25 * (2.0 * len(t) / 15.0 + 1.0)))
+
+    def lote(self, textos, cancel=None):
+        """Sintetiza varios trozos a la vez (agrupados por longitud). Devuelve los audios en el mismo orden."""
+        import numpy as np
+        resultado = [None] * len(textos)
+        pendientes = sorted(range(len(textos)), key=lambda i: -len(textos[i]))
+        tam = max(1, self.lote_max)
+        while pendientes:
+            if cancel is not None and cancel.is_set():
+                raise Cancelado()
+            grupo = pendientes[:tam]
+            if tam == 1 or len(grupo) == 1:
+                for i in grupo:
+                    resultado[i] = self(textos[i])
+                pendientes = pendientes[len(grupo):]
+                continue
+            try:
+                self.torch.manual_seed(zlib.crc32(textos[grupo[0]].encode("utf-8")))
+                filas = self.m.generate_lote([textos[i] for i in grupo], language_id="es",
+                                             exaggeration=CB_EXAG, cfg_weight=CB_CFG, temperature=CB_TEMP,
+                                             limite_tokens=self._limite_tokens)
+            except Exception as e:
+                oom = "out of memory" in str(e).lower()
+                if self.dispositivo == "cuda":
+                    self.torch.cuda.empty_cache()
+                if oom and tam > 1:
+                    tam = max(1, tam // 2)
+                    self.lote_max = tam
+                    self.log(f"Poca memoria de GPU: se reduce a {tam} trozos a la vez.")
+                else:
+                    self.log(f"Aviso: el modo por lotes falló ({type(e).__name__}: {str(e)[:200]}); "
+                             f"se sigue de uno en uno.")
+                    tam = self.lote_max = 1
+                continue
+            for i, (a, completo) in zip(grupo, filas):
+                esperado = max(1.0, len(textos[i]) / 15.0)
+                dur = len(a) / SAMPLE_RATE
+                if completo and 0.4 * esperado - 0.5 <= dur <= 2.0 * esperado + 1.0:
+                    resultado[i] = np.asarray(a, dtype="float32")
+                else:
+                    self.reintentos += 1
+                    resultado[i] = self(textos[i])        # repeticion individual con varias semillas
+            pendientes = pendientes[len(grupo):]
+        return resultado
+
+
+# ----------------------------------------------------------------------------
+# Motor Voxtral (Mistral Voxtral-4B-TTS-2603) a traves del binario CrispASR (formato GGUF propio)
+# Ojo: estos GGUF NO sirven en LM Studio / Unsloth / llama.cpp (otra arquitectura).
+# ----------------------------------------------------------------------------
+def _caminar(base, patron, prof=6):
+    base = Path(base)
+    if not base.is_dir():
+        return
+    n0 = len(base.parts)
+    for raiz, dirs, ficheros in os.walk(base):
+        if len(Path(raiz).parts) - n0 >= prof:
+            dirs[:] = []
+        for f in ficheros:
+            if patron(f.lower()):
+                yield Path(raiz) / f
+
+
+def buscar_gguf_voxtral():
+    """GGUF de Voxtral TTS ya descargado: ajustes, variable de entorno o carpetas habituales."""
+    for cand in (cargar_ajustes().get("vx_gguf"), os.environ.get("AUDIOLIBRO_VOXTRAL_GGUF")):
+        if cand and Path(cand).is_file():
+            return str(cand)
+    home = Path.home()
+    sitios = [DIR_MODELOS / "voxtral", home / ".lmstudio" / "models", home / ".cache" / "lm-studio" / "models",
+              home / ".cache" / "huggingface" / "hub", home / ".unsloth", home / ".cache" / "unsloth",
+              home / "Downloads", home / "Descargas"]
+    hallados = []
+    for sitio in sitios:
+        for f in _caminar(sitio, lambda n: n.endswith(".gguf") and "voxtral" in n and "tts" in n):
+            hallados.append(f)
+    orden = ("q8_0", "f16", "q6_k", "q5_k", "q4_k")       # calidad primero: caben de sobra en 16 GB
+
+    def peso(f):
+        n = f.name.lower()
+        return next((i for i, q in enumerate(orden) if q in n), len(orden))
+    hallados.sort(key=peso)
+    return str(hallados[0]) if hallados else ""
+
+
+def buscar_crispasr():
+    exe = "crispasr.exe" if os.name == "nt" else "crispasr"
+    for cand in (cargar_ajustes().get("vx_exe"), os.environ.get("AUDIOLIBRO_CRISPASR"),
+                 _dir_datos() / "bin" / exe, APP_DIR / exe, shutil.which("crispasr")):
+        if cand and Path(cand).is_file():
+            return str(cand)
+    return ""
+
+
+def _http(url, clave="", cuerpo=None, timeout=30):
+    """GET/POST JSON sencillo (sin dependencias). Devuelve (bytes, content_type)."""
+    import urllib.request
+    import urllib.error
+    cab = {"User-Agent": "Audiolibro/2"}
+    if clave:
+        cab["Authorization"] = f"Bearer {clave}"
+    datos = None
+    if cuerpo is not None:
+        datos = json.dumps(cuerpo).encode("utf-8")
+        cab["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=datos, headers=cab)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read(), r.headers.get("Content-Type", "")
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"El servidor respondió {e.code}: {e.read()[:400].decode('utf-8', 'replace')}")
+
+
+def buscar_servidor_unsloth():
+    """URL base del servidor de Unsloth Studio (ajustes, entorno o puertos habituales)."""
+    aj = cargar_ajustes()
+    clave = aj.get("vx_clave") or os.environ.get("UNSLOTH_API_KEY", "")
+    cands = [aj.get("vx_url"), os.environ.get("AUDIOLIBRO_VOXTRAL_URL"),
+             "http://127.0.0.1:8888", "http://127.0.0.1:8000"]
+    for u in cands:
+        if not u:
+            continue
+        u = u.rstrip("/")
+        try:
+            _http(u + "/v1/models", clave, timeout=2)
+            return u
+        except RuntimeError:
+            return u                      # responde (p. ej. 401 sin clave): es el servidor
+        except Exception:
+            continue
+    return ""
+
+
+def _modelo_api(url, clave):
+    aj = cargar_ajustes()
+    if aj.get("vx_modelo"):
+        return aj["vx_modelo"]
+    datos, _ = _http(url + "/v1/models", clave)
+    j = json.loads(datos.decode("utf-8"))
+    ids = [m.get("id", "") for m in (j.get("data", j) if isinstance(j, dict) else j)]
+    for i in ids:
+        if "voxtral" in i.lower():
+            return i
+    if ids:
+        return ids[0]
+    raise RuntimeError("Unsloth no tiene ningún modelo cargado: carga Voxtral TTS en Unsloth Studio.")
+
+
+def sondear_voxtral(log=print):
+    """Muestra lo que ve la aplicacion en el servidor (para diagnosticar)."""
+    aj = cargar_ajustes()
+    clave = aj.get("vx_clave") or os.environ.get("UNSLOTH_API_KEY", "")
+    url = buscar_servidor_unsloth()
+    if not url:
+        log("No encuentro el servidor de Unsloth (probé 127.0.0.1:8888 y :8000).")
+        return 1
+    log(f"Servidor: {url}  (clave {'sí' if clave else 'NO configurada'})")
+    for ruta in ("/v1/models", "/v1/audio/voices"):
+        try:
+            datos, _ = _http(url + ruta, clave, timeout=10)
+            log(f"{ruta}: {datos.decode('utf-8', 'replace')[:1500]}")
+        except Exception as e:
+            log(f"{ruta}: {e}")
+    return 0
+
+
+class SintVoxtral:
+    """Voxtral TTS: via el servidor de Unsloth Studio (/v1/audio/speech) o, si no, con CrispASR."""
+    def __init__(self, voz, velocidad, usar_gpu=True, log=print, falso=False):
+        self.voz, self.velocidad, self.falso, self.log = voz, velocidad, falso, log
+        self.dispositivo = "falso"
+        self.vacios = 0
+        self.reintentos = 0
+        if falso:
+            return
+        self.nombre_voz = str(voz)[3:]
+        self.usar_gpu = usar_gpu
+        aj = cargar_ajustes()
+        self.clave = aj.get("vx_clave") or os.environ.get("UNSLOTH_API_KEY", "")
+        self.url = buscar_servidor_unsloth()
+        if self.url:
+            self.modo = "api"
+            self.modelo = _modelo_api(self.url, self.clave)
+            self.dispositivo = "cuda"
+            log(f"Voxtral vía Unsloth ({self.url}), modelo {self.modelo}, voz {self.nombre_voz}")
+            return
+        self.modo = "cli"
+        self.exe = buscar_crispasr()
+        if not self.exe:
+            raise RuntimeError(
+                "No encuentro Voxtral: abre Unsloth Studio, carga Voxtral TTS, crea una clave en "
+                "Ajustes > API y pégala aquí; o indica crispasr.exe.")
+        self.gguf = buscar_gguf_voxtral()
+        self.dispositivo = "cuda" if usar_gpu else "cpu"
+        log(f"Voxtral: {Path(self.gguf).name if self.gguf else 'auto'} con {Path(self.exe).name}, "
+            f"voz {self.nombre_voz}")
+
+    def _leer(self, datos):
+        import numpy as np
+        import soundfile as sf
+        import io
+        a, sr = sf.read(io.BytesIO(datos), dtype="float32", always_2d=False)
+        if getattr(a, "ndim", 1) > 1:
+            a = a.mean(axis=1)
+        if sr != SAMPLE_RATE and len(a):
+            n = int(round(len(a) * SAMPLE_RATE / sr))
+            a = np.interp(np.linspace(0, len(a) - 1, n), np.arange(len(a)), a).astype("float32")
+        return np.asarray(a, dtype="float32").reshape(-1)
+
+    def _sintetizar(self, texto, semilla):
+        if self.modo == "api":
+            datos, tipo = _http(self.url + "/v1/audio/speech", self.clave,
+                                {"model": self.modelo, "input": texto, "voice": self.nombre_voz,
+                                 "response_format": "wav"}, timeout=900)
+            if "json" in tipo.lower():
+                raise RuntimeError(f"Respuesta inesperada de Unsloth: {datos[:300].decode('utf-8', 'replace')}")
+            return self._leer(datos)
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "o.wav"
+            cmd = [self.exe, "--backend", "voxtral-tts"]
+            cmd += ["-m", self.gguf] if self.gguf else ["-m", "auto", "--auto-download"]
+            cmd += ["--tts", texto, "--voice", self.nombre_voz, "--tts-output", str(out), "--seed", str(semilla)]
+            env = dict(os.environ)
+            if not self.usar_gpu:
+                env["CUDA_VISIBLE_DEVICES"] = ""
+            r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, env=env, timeout=900,
+                               creationflags=0x08000000 if os.name == "nt" else 0)
+            if r.returncode != 0 or not out.exists():
+                cola = (r.stderr or r.stdout or b"").decode("utf-8", "replace")[-600:]
+                raise RuntimeError(f"CrispASR falló (código {r.returncode}): {cola}")
+            return self._leer(out.read_bytes())
+
+    def __call__(self, texto):
+        import numpy as np
+        if self.falso:
+            return _tono(texto)
+        esperado = max(1.0, len(texto) / 15.0)
+        mejor, mejor_err = None, None
+        for intento in range(3):
+            a = self._sintetizar(texto, zlib.crc32(texto.encode("utf-8")) % 100000 + intento)
+            dur = len(a) / SAMPLE_RATE
+            err = abs(math.log(max(dur, 0.05) / esperado))
+            if mejor is None or err < mejor_err:
+                mejor, mejor_err = a, err
+            if 0.4 * esperado - 0.5 <= dur <= 2.0 * esperado + 1.0:
+                break
+            self.reintentos += 1
+        if mejor is None or not len(mejor):
+            self.vacios += 1
+            return np.zeros(0, dtype="float32")
+        return mejor
+
 
 def Sintetizador(voz, velocidad, usar_gpu=True, log=print, falso=False, voz_ref=""):
     if motor_de(voz) == "chatterbox":
         return SintChatterbox(voz, velocidad, usar_gpu, log, falso, voz_ref)
+    if motor_de(voz) == "voxtral":
+        return SintVoxtral(voz, velocidad, usar_gpu, log, falso)
     return SintKokoro(voz, velocidad, usar_gpu, log, falso)
 
 
@@ -779,6 +1075,29 @@ def _fmt_t(seg):
     return f"{seg // 3600}h {seg % 3600 // 60:02d}m" if seg >= 3600 else f"{seg // 60}m {seg % 60:02d}s"
 
 
+def _pasos_sintetizados(pasos, sint, cancel):
+    """Recorre los pasos de un capitulo y entrega (tipo, valor, audio). Con motor por lotes, sintetiza
+    ventanas de varios trozos a la vez; si no, uno a uno."""
+    if getattr(sint, "lote_max", 1) <= 1:
+        for k, v in pasos:
+            if cancel.is_set():
+                raise Cancelado()
+            yield k, v, (sint(v) if k == "t" else None)
+        return
+    ventana = max(8, sint.lote_max * 3)
+    i, n = 0, len(pasos)
+    while i < n:
+        j, textos = i, []
+        while j < n and len(textos) < ventana:
+            if pasos[j][0] == "t":
+                textos.append(pasos[j][1])
+            j += 1
+        audios = iter(sint.lote(textos, cancel))
+        for k, v in pasos[i:j]:
+            yield k, v, (next(audios) if k == "t" else None)
+        i = j
+
+
 def convertir(libro, cfg, log=print, progreso=None, cancel=None):
     import numpy as np
     import soundfile as sf
@@ -793,7 +1112,8 @@ def convertir(libro, cfg, log=print, progreso=None, cancel=None):
     trabajo = out_dir / (base + "_temporal")
     trabajo.mkdir(exist_ok=True)
 
-    planes = {i: plan_capitulo(c, cfg.leer_titulos) for i, c in caps}
+    maxc = VX_MAX_CHARS if motor_de(cfg.voz) == "voxtral" else MAX_CHARS
+    planes = {i: plan_capitulo(c, cfg.leer_titulos, maxc) for i, c in caps}
     chars = {i: sum(len(v) for k, v in pl if k == "t") for i, pl in planes.items()}
     total = max(1, sum(chars.values()))
     log(f"{len(caps)} capitulos, {total:,} caracteres a locutar.".replace(",", "."))
@@ -818,13 +1138,13 @@ def convertir(libro, cfg, log=print, progreso=None, cancel=None):
         tmp = wav.with_suffix(".part")
         with sf.SoundFile(str(tmp), mode="w", samplerate=SAMPLE_RATE, channels=1,
                           subtype="PCM_16", format="WAV") as f:
-            for k, v in planes[i]:
+            for k, v, audio in _pasos_sintetizados(planes[i], sint, cancel):
                 if cancel.is_set():
                     raise Cancelado()
                 if k == "s":
                     f.write(np.zeros(int(SAMPLE_RATE * v), dtype="float32"))
                     continue
-                a = acondicionar(sint(v))
+                a = acondicionar(audio)
                 if len(a):
                     f.write(np.clip(a, -1.0, 1.0))
                 hecho += len(v)
@@ -883,6 +1203,45 @@ def diagnostico():
     return 0
 
 
+BENCH_TEXTOS = [
+    "En un lugar de la Mancha, de cuyo nombre no quiero acordarme, no ha mucho tiempo que vivía un hidalgo de los de lanza en astillero.",
+    "Una olla de algo más vaca que carnero, salpicón las más noches, duelos y quebrantos los sábados, lentejas los viernes.",
+    "El resto della concluían sayo de velarte, calzas de velludo para las fiestas con sus pantuflos de lo mismo.",
+    "Tenía en su casa una ama que pasaba de los cuarenta, y una sobrina que no llegaba a los veinte, y un mozo de campo y plaza.",
+    "Frisaba la edad de nuestro hidalgo con los cincuenta años; era de complexión recia, seco de carnes, enjuto de rostro.",
+    "Es, pues, de saber que este sobredicho hidalgo, los ratos que estaba ocioso, que eran los más del año, se daba a leer libros de caballerías.",
+    "Con tanta afición y gusto, que olvidó casi de todo punto el ejercicio de la caza, y aun la administración de su hacienda.",
+    "Llegó a vender muchas fanegas de tierra de sembradura para comprar libros de caballerías en que leer.",
+]
+
+
+def bench(lotes=(1, 4, 8), usar_gpu=True, log=print):
+    """Mide la velocidad real de Chatterbox con distintos tamaños de lote (16 trozos de ~130 caracteres)."""
+    textos = (BENCH_TEXTOS * 2)[:16]
+    sint = Sintetizador("cb:f1", 1.0, usar_gpu, log)
+    if not hasattr(sint, "m"):
+        log("El banco de pruebas necesita el motor Chatterbox.")
+        return 1
+    sint.lote_max = 1
+    sint(textos[0])                                         # calentamiento
+    for n in lotes:
+        sint.lote_max = n
+        sint.reintentos = 0
+        if sint.dispositivo == "cuda":
+            sint.torch.cuda.synchronize()
+            sint.torch.cuda.reset_peak_memory_stats()
+        t = time.time()
+        audios = sint.lote(textos)
+        if sint.dispositivo == "cuda":
+            sint.torch.cuda.synchronize()
+        dt = time.time() - t
+        seg = sum(len(a) for a in audios) / SAMPLE_RATE
+        vram = f", VRAM máx {sint.torch.cuda.max_memory_allocated() / 2**30:.1f} GB" if sint.dispositivo == "cuda" else ""
+        log(f"lote {n:2d}: {seg:.0f} s de audio en {dt:.0f} s -> {seg / dt:.2f}x tiempo real, "
+            f"{sint.reintentos} repetidos{vram}")
+    return 0
+
+
 def precargar_hq():
     print("Descargando el modelo de alta calidad (unos 4,3 GB, solo la primera vez)...")
     cargar_chatterbox("cpu", print)
@@ -912,12 +1271,21 @@ def gui():
     except Exception:
         pass
 
+    # Paleta calida: crema de fondo, indigo profundo en la cabecera y naranja como acento.
+    C = {"fondo": "#FBF6EF", "tarjeta": "#FFFFFF", "borde": "#E8DDCE", "indigo": "#3A2E5D",
+         "indigo2": "#5B4A8F", "acento": "#E8743B", "acento_h": "#D1622C", "acento_p": "#B95524",
+         "texto": "#2B2438", "suave": "#7A7088", "claro": "#D9CFF0", "fila": "#FAF3E8",
+         "gris": "#EDE5D9"}
+    FUENTE = "Segoe UI"
+    MARCA_SI, MARCA_NO = "✔", "○"
+
     class App:
         def __init__(self, root):
             self.root = root
             root.title("Audiolibro - EPUB / PDF / TXT a audio")
-            root.geometry("900x780")
-            root.minsize(820, 700)
+            root.geometry("1120x780")
+            root.minsize(1000, 700)
+            root.configure(bg=C["fondo"])
             self.q = queue.Queue()
             self.libro = None
             self.cancel = threading.Event()
@@ -938,92 +1306,220 @@ def gui():
             self.v_gpu_txt = tk.StringVar(value="Comprobando GPU...")
             self.v_estado = tk.StringVar(value="Elige un libro para empezar.")
 
-            f = ttk.Frame(root, padding=10)
-            f.pack(fill="both", expand=True)
-            f.columnconfigure(1, weight=1)
+            self._estilos()
 
-            ttk.Label(f, text="Libro:").grid(row=0, column=0, sticky="w")
-            ttk.Entry(f, textvariable=self.v_archivo).grid(row=0, column=1, sticky="ew", padx=6)
-            ttk.Button(f, text="Examinar...", command=self.elegir).grid(row=0, column=2)
-            ttk.Button(f, text="Analizar", command=self.analizar).grid(row=0, column=3, padx=(6, 0))
+            # --- cabecera
+            cab = tk.Frame(root, bg=C["indigo"])
+            cab.pack(fill="x")
+            tk.Label(cab, text="\U0001F3A7  Audiolibro", bg=C["indigo"], fg="white",
+                     font=(FUENTE, 22, "bold")).pack(side="left", padx=(24, 12), pady=(14, 14))
+            tk.Label(cab, text="Convierte tus libros en audio con voces naturales, en tu propio PC",
+                     bg=C["indigo"], fg=C["claro"], font=(FUENTE, 11)).pack(side="left", pady=(20, 0))
+            tk.Frame(root, bg=C["acento"], height=4).pack(fill="x")
 
+            cuerpo = tk.Frame(root, bg=C["fondo"])
+            cuerpo.pack(fill="both", expand=True, padx=20, pady=(14, 16))
+            cuerpo.columnconfigure(0, weight=11, uniform="c")
+            cuerpo.columnconfigure(1, weight=10, uniform="c")
+            cuerpo.rowconfigure(0, weight=1)
+
+            izq = tk.Frame(cuerpo, bg=C["fondo"])
+            izq.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+            der = tk.Frame(cuerpo, bg=C["fondo"])
+            der.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+
+            # --- 1. Libro
+            t1 = self._tarjeta(izq, "1  ·  Tu libro")
+            t1.pack(fill="x")
+            t1.columnconfigure(0, weight=1)
+            ttk.Entry(t1, textvariable=self.v_archivo).grid(row=0, column=0, sticky="ew", padx=(0, 8))
+            ttk.Button(t1, text="Examinar...", style="Suave.TButton",
+                       command=self.elegir).grid(row=0, column=1)
+            ttk.Button(t1, text="Analizar", style="Suave.TButton",
+                       command=self.analizar).grid(row=0, column=2, padx=(6, 0))
+
+            # --- capitulos
+            t2 = self._tarjeta(izq, "Capítulos  (clic para marcar / desmarcar)")
+            t2.pack(fill="both", expand=True, pady=(12, 0))
+            t2.columnconfigure(0, weight=1)
+            t2.rowconfigure(0, weight=1)
             cols = ("sel", "titulo", "chars")
-            self.tree = ttk.Treeview(f, columns=cols, show="headings", height=9, selectmode="none")
+            self.tree = ttk.Treeview(t2, columns=cols, show="headings", height=9, selectmode="none",
+                                     style="Cap.Treeview")
             self.tree.heading("sel", text="Leer")
-            self.tree.heading("titulo", text="Capitulo (clic para marcar / desmarcar)")
+            self.tree.heading("titulo", text="Capítulo")
             self.tree.heading("chars", text="Caracteres")
-            self.tree.column("sel", width=50, anchor="center", stretch=False)
-            self.tree.column("titulo", width=560)
+            self.tree.column("sel", width=56, anchor="center", stretch=False)
+            self.tree.column("titulo", width=360)
             self.tree.column("chars", width=90, anchor="e", stretch=False)
+            self.tree.tag_configure("par", background=C["tarjeta"])
+            self.tree.tag_configure("impar", background=C["fila"])
             self.tree.bind("<Button-1>", self.alternar)
-            sb = ttk.Scrollbar(f, orient="vertical", command=self.tree.yview)
+            sb = ttk.Scrollbar(t2, orient="vertical", command=self.tree.yview)
             self.tree.configure(yscrollcommand=sb.set)
-            self.tree.grid(row=1, column=0, columnspan=4, sticky="nsew", pady=(8, 0))
-            sb.grid(row=1, column=4, sticky="ns", pady=(8, 0))
-            f.rowconfigure(1, weight=2)
+            self.tree.grid(row=0, column=0, sticky="nsew")
+            sb.grid(row=0, column=1, sticky="ns")
+            bt = tk.Frame(t2, bg=C["tarjeta"])
+            bt.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+            ttk.Button(bt, text="Marcar todo", style="Suave.TButton",
+                       command=lambda: self.marcar(True)).pack(side="left")
+            ttk.Button(bt, text="Desmarcar todo", style="Suave.TButton",
+                       command=lambda: self.marcar(False)).pack(side="left", padx=6)
 
-            bt = ttk.Frame(f)
-            bt.grid(row=2, column=0, columnspan=4, sticky="w", pady=4)
-            ttk.Button(bt, text="Marcar todo", command=lambda: self.marcar(True)).pack(side="left")
-            ttk.Button(bt, text="Desmarcar todo", command=lambda: self.marcar(False)).pack(side="left", padx=6)
-
-            op = ttk.LabelFrame(f, text="Opciones", padding=8)
-            op.grid(row=3, column=0, columnspan=4, sticky="ew", pady=6)
-            op.columnconfigure(1, weight=1)
-            ttk.Label(op, text="Motor:").grid(row=0, column=0, sticky="w")
-            self.cb_motor = ttk.Combobox(op, textvariable=self.v_motor, state="readonly", width=42,
+            # --- 2. Voz
+            t3 = self._tarjeta(der, "2  ·  Voz")
+            t3.pack(fill="x")
+            t3.columnconfigure(1, weight=1)
+            ttk.Label(t3, text="Motor", style="Card.TLabel").grid(row=0, column=0, sticky="w")
+            self.cb_motor = ttk.Combobox(t3, textvariable=self.v_motor, state="readonly",
                                          values=list(MOTORES.values()))
-            self.cb_motor.grid(row=0, column=1, sticky="w", padx=6, pady=2)
+            self.cb_motor.grid(row=0, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=3)
             self.cb_motor.bind("<<ComboboxSelected>>", lambda e: self.cambia_motor())
-            ttk.Label(op, text="Voz:").grid(row=1, column=0, sticky="w")
-            self.cb_voz = ttk.Combobox(op, textvariable=self.v_voz, state="readonly", width=60)
-            self.cb_voz.grid(row=1, column=1, sticky="w", padx=6, pady=2)
+            ttk.Label(t3, text="Voz", style="Card.TLabel").grid(row=1, column=0, sticky="w")
+            self.cb_voz = ttk.Combobox(t3, textvariable=self.v_voz, state="readonly")
+            self.cb_voz.grid(row=1, column=1, sticky="ew", padx=(10, 6), pady=3)
             self.cb_voz.bind("<<ComboboxSelected>>", lambda e: self.cambia_voz())
-            ttk.Button(op, text="Escuchar muestra", command=self.muestra).grid(row=1, column=2, padx=6)
-            ttk.Label(op, text="Audio de referencia:").grid(row=2, column=0, sticky="w")
-            self.en_ref = ttk.Entry(op, textvariable=self.v_ref, state="readonly")
-            self.en_ref.grid(row=2, column=1, sticky="ew", padx=6, pady=2)
-            self.bt_ref = ttk.Button(op, text="Elegir...", command=self.elegir_ref)
-            self.bt_ref.grid(row=2, column=2, padx=6)
-            ttk.Label(op, textvariable=self.v_info, foreground="#555", wraplength=760,
-                      justify="left").grid(row=3, column=0, columnspan=3, sticky="w", pady=(2, 4))
-            ttk.Label(op, text="Velocidad:").grid(row=4, column=0, sticky="w", pady=4)
-            fv = ttk.Frame(op)
-            fv.grid(row=4, column=1, sticky="w", padx=6)
-            ttk.Scale(fv, from_=0.7, to=1.4, variable=self.v_vel, length=200,
-                      command=lambda _=None: self.lbl_vel.config(text=f"{self.v_vel.get():.2f}x")).pack(side="left")
-            self.lbl_vel = ttk.Label(fv, text="1.00x", width=6)
-            self.lbl_vel.pack(side="left", padx=6)
-            ttk.Label(op, text="Formato:").grid(row=5, column=0, sticky="w")
-            ttk.Combobox(op, textvariable=self.v_fmt, state="readonly", width=42,
-                         values=list(FORMATOS.values())).grid(row=5, column=1, sticky="w", padx=6, pady=2)
-            ttk.Label(op, text="Guardar en:").grid(row=6, column=0, sticky="w", pady=4)
-            ttk.Entry(op, textvariable=self.v_salida).grid(row=6, column=1, sticky="ew", padx=6)
-            ttk.Button(op, text="Cambiar...", command=self.elegir_salida).grid(row=6, column=2, padx=6)
-            self.chk_gpu = ttk.Checkbutton(op, text="Usar la GPU (CUDA)", variable=self.v_gpu)
-            self.chk_gpu.grid(row=7, column=0, columnspan=2, sticky="w")
-            ttk.Label(op, textvariable=self.v_gpu_txt, foreground="#555").grid(row=7, column=1, columnspan=2, sticky="e")
-            ttk.Checkbutton(op, text="Leer en voz alta el titulo de cada capitulo",
-                            variable=self.v_tit).grid(row=8, column=0, columnspan=3, sticky="w")
-            ttk.Checkbutton(op, text="Audio limpio: volumen uniforme y sin graves molestos",
-                            variable=self.v_norm).grid(row=9, column=0, columnspan=3, sticky="w")
+            ttk.Button(t3, text="▶  Escuchar", style="Suave.TButton",
+                       command=self.muestra).grid(row=1, column=2)
+            ttk.Label(t3, text="Referencia", style="Card.TLabel").grid(row=2, column=0, sticky="w")
+            self.en_ref = ttk.Entry(t3, textvariable=self.v_ref, state="readonly")
+            self.en_ref.grid(row=2, column=1, sticky="ew", padx=(10, 6), pady=3)
+            self.bt_ref = ttk.Button(t3, text="Elegir...", style="Suave.TButton", command=self.elegir_ref)
+            self.bt_ref.grid(row=2, column=2)
+            aj = cargar_ajustes()
+            self.v_vx_url = tk.StringVar(value=aj.get("vx_url") or "http://127.0.0.1:8888")
+            self.v_vx_clave = tk.StringVar(value=aj.get("vx_clave", ""))
+            self.fila_vx = []
+            for fila, (txt, var, oculto) in enumerate((("Servidor Unsloth", self.v_vx_url, ""),
+                                                       ("Clave API", self.v_vx_clave, "\u2022")), 3):
+                e1 = ttk.Label(t3, text=txt, style="Card.TLabel")
+                e2 = ttk.Entry(t3, textvariable=var, show=oculto)
+                e1.grid(row=fila, column=0, sticky="w")
+                e2.grid(row=fila, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=3)
+                self.fila_vx.append((e1, e2))
+            ttk.Label(t3, textvariable=self.v_info, style="Nota.TLabel", wraplength=470,
+                      justify="left").grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+            # --- 3. Ajustes
+            t4 = self._tarjeta(der, "3  ·  Ajustes")
+            t4.pack(fill="x", pady=(12, 0))
+            t4.columnconfigure(1, weight=1)
+            ttk.Label(t4, text="Velocidad", style="Card.TLabel").grid(row=0, column=0, sticky="w")
+            fv = tk.Frame(t4, bg=C["tarjeta"])
+            fv.grid(row=0, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=3)
+            fv.columnconfigure(0, weight=1)
+            ttk.Scale(fv, from_=0.7, to=1.4, variable=self.v_vel, style="Acento.Horizontal.TScale",
+                      command=lambda _=None: self.lbl_vel.config(text=f"{self.v_vel.get():.2f}x")
+                      ).grid(row=0, column=0, sticky="ew")
+            self.lbl_vel = ttk.Label(fv, text="1.00x", style="Valor.TLabel", width=6, anchor="e")
+            self.lbl_vel.grid(row=0, column=1, padx=(8, 0))
+            ttk.Label(t4, text="Formato", style="Card.TLabel").grid(row=1, column=0, sticky="w")
+            ttk.Combobox(t4, textvariable=self.v_fmt, state="readonly",
+                         values=list(FORMATOS.values())).grid(row=1, column=1, columnspan=2, sticky="ew",
+                                                              padx=(10, 0), pady=3)
+            ttk.Label(t4, text="Guardar en", style="Card.TLabel").grid(row=2, column=0, sticky="w")
+            ttk.Entry(t4, textvariable=self.v_salida).grid(row=2, column=1, sticky="ew", padx=(10, 6), pady=3)
+            ttk.Button(t4, text="Cambiar...", style="Suave.TButton",
+                       command=self.elegir_salida).grid(row=2, column=2)
+            self.chk_gpu = ttk.Checkbutton(t4, text="Usar la GPU (CUDA)", variable=self.v_gpu,
+                                           style="Card.TCheckbutton")
+            self.chk_gpu.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+            ttk.Label(t4, textvariable=self.v_gpu_txt, style="Nota.TLabel").grid(row=3, column=1, columnspan=2,
+                                                                                 sticky="e", pady=(6, 0))
+            ttk.Checkbutton(t4, text="Leer en voz alta el título de cada capítulo", variable=self.v_tit,
+                            style="Card.TCheckbutton").grid(row=4, column=0, columnspan=3, sticky="w")
+            ttk.Checkbutton(t4, text="Audio limpio: volumen uniforme y sin graves molestos",
+                            variable=self.v_norm, style="Card.TCheckbutton"
+                            ).grid(row=5, column=0, columnspan=3, sticky="w")
             self.cambia_motor()
 
-            ac = ttk.Frame(f)
-            ac.grid(row=4, column=0, columnspan=4, sticky="ew", pady=4)
-            self.btn_go = ttk.Button(ac, text="CONVERTIR A AUDIOLIBRO", command=self.convertir)
+            # --- accion, progreso y registro (ancho completo)
+            pie = tk.Frame(root, bg=C["fondo"])
+            pie.pack(fill="x", padx=20, pady=(0, 16))
+            pie.columnconfigure(0, weight=1)
+            ac = tk.Frame(pie, bg=C["fondo"])
+            ac.grid(row=0, column=0, sticky="ew")
+            self.btn_go = ttk.Button(ac, text="▶   CONVERTIR A AUDIOLIBRO", style="Accion.TButton",
+                                     command=self.convertir)
             self.btn_go.pack(side="left")
-            self.btn_stop = ttk.Button(ac, text="Cancelar", command=self.cancelar, state="disabled")
-            self.btn_stop.pack(side="left", padx=8)
-            self.pb = ttk.Progressbar(f, maximum=1000)
-            self.pb.grid(row=5, column=0, columnspan=4, sticky="ew")
-            ttk.Label(f, textvariable=self.v_estado).grid(row=6, column=0, columnspan=4, sticky="w", pady=2)
-            self.log = tk.Text(f, height=7, state="disabled", wrap="word", font=("Consolas", 9))
-            self.log.grid(row=7, column=0, columnspan=4, sticky="nsew")
-            f.rowconfigure(7, weight=1)
+            self.btn_stop = ttk.Button(ac, text="Cancelar", style="Suave.TButton", command=self.cancelar,
+                                       state="disabled")
+            self.btn_stop.pack(side="left", padx=12)
+            ttk.Label(ac, textvariable=self.v_estado, style="Estado.TLabel").pack(side="left", padx=8)
+            self.pb = ttk.Progressbar(pie, maximum=1000, style="Acento.Horizontal.TProgressbar")
+            self.pb.grid(row=1, column=0, sticky="ew", pady=(10, 8))
+            self.log = tk.Text(pie, height=6, state="disabled", wrap="word", font=("Consolas", 9),
+                               bg=C["tarjeta"], fg=C["texto"], relief="flat", bd=0, padx=10, pady=8,
+                               highlightthickness=1, highlightbackground=C["borde"],
+                               highlightcolor=C["borde"])
+            self.log.grid(row=2, column=0, sticky="ew")
 
             threading.Thread(target=self._detectar_gpu, daemon=True).start()
             root.after(100, self._poll)
+
+        # --- aspecto
+        def _estilos(self):
+            s = ttk.Style(self.root)
+            try:
+                s.theme_use("clam")
+            except Exception:
+                pass
+            s.configure(".", font=(FUENTE, 10), background=C["tarjeta"], foreground=C["texto"])
+            s.configure("Card.TLabel", background=C["tarjeta"], foreground=C["texto"])
+            s.configure("Nota.TLabel", background=C["tarjeta"], foreground=C["suave"], font=(FUENTE, 9))
+            s.configure("Valor.TLabel", background=C["tarjeta"], foreground=C["acento"],
+                        font=(FUENTE, 10, "bold"))
+            s.configure("Estado.TLabel", background=C["fondo"], foreground=C["suave"], font=(FUENTE, 10))
+            s.configure("TEntry", fieldbackground="#FFFFFF", bordercolor=C["borde"], lightcolor=C["borde"],
+                        darkcolor=C["borde"], padding=5)
+            s.map("TEntry", bordercolor=[("focus", C["indigo2"])], lightcolor=[("focus", C["indigo2"])])
+            s.configure("TCombobox", fieldbackground="#FFFFFF", background=C["gris"], bordercolor=C["borde"],
+                        lightcolor=C["borde"], darkcolor=C["borde"], arrowcolor=C["indigo"], padding=5)
+            s.map("TCombobox", fieldbackground=[("readonly", "#FFFFFF")],
+                  bordercolor=[("focus", C["indigo2"])], foreground=[("readonly", C["texto"])],
+                  selectbackground=[("readonly", "#FFFFFF")], selectforeground=[("readonly", C["texto"])])
+            self.root.option_add("*TCombobox*Listbox.background", "#FFFFFF")
+            self.root.option_add("*TCombobox*Listbox.foreground", C["texto"])
+            self.root.option_add("*TCombobox*Listbox.selectBackground", C["indigo2"])
+            self.root.option_add("*TCombobox*Listbox.selectForeground", "#FFFFFF")
+            self.root.option_add("*TCombobox*Listbox.font", (FUENTE, 10))
+            s.configure("Suave.TButton", background=C["gris"], foreground=C["indigo"], borderwidth=0,
+                        focusthickness=0, padding=(12, 6), font=(FUENTE, 10))
+            s.map("Suave.TButton", background=[("disabled", "#F3EEE6"), ("pressed", "#D8CDBC"),
+                                               ("active", "#E2D8C8")],
+                  foreground=[("disabled", "#B3AAA0")])
+            s.configure("Accion.TButton", background=C["acento"], foreground="white", borderwidth=0,
+                        focusthickness=0, padding=(26, 12), font=(FUENTE, 12, "bold"))
+            s.map("Accion.TButton", background=[("disabled", "#EFC3AB"), ("pressed", C["acento_p"]),
+                                                ("active", C["acento_h"])],
+                  foreground=[("disabled", "#FFFFFF")])
+            s.configure("Card.TCheckbutton", background=C["tarjeta"], foreground=C["texto"], padding=3)
+            s.map("Card.TCheckbutton", background=[("active", C["tarjeta"])],
+                  indicatorcolor=[("selected", C["acento"]), ("!selected", "#FFFFFF")],
+                  indicatorbackground=[("selected", C["acento"]), ("!selected", "#FFFFFF")])
+            s.configure("Acento.Horizontal.TScale", background=C["tarjeta"], troughcolor=C["gris"],
+                        bordercolor=C["tarjeta"], lightcolor=C["acento"], darkcolor=C["acento"])
+            s.map("Acento.Horizontal.TScale", background=[("active", C["acento_h"])])
+            s.configure("Acento.Horizontal.TProgressbar", troughcolor=C["gris"], background=C["acento"],
+                        bordercolor=C["fondo"], lightcolor=C["acento"], darkcolor=C["acento"], thickness=14)
+            s.configure("Cap.Treeview", background=C["tarjeta"], fieldbackground=C["tarjeta"],
+                        foreground=C["texto"], rowheight=28, borderwidth=0, font=(FUENTE, 10))
+            s.configure("Cap.Treeview.Heading", background=C["indigo"], foreground="white", relief="flat",
+                        font=(FUENTE, 10, "bold"), padding=(8, 6))
+            s.map("Cap.Treeview.Heading", background=[("active", C["indigo2"])])
+            s.configure("Vertical.TScrollbar", background=C["gris"], troughcolor=C["tarjeta"],
+                        bordercolor=C["tarjeta"], arrowcolor=C["indigo"])
+
+        def _tarjeta(self, padre, titulo):
+            """Tarjeta blanca con borde suave y titulo en indigo; devuelve el marco interior."""
+            ext = tk.Frame(padre, bg=C["tarjeta"], highlightthickness=1, highlightbackground=C["borde"])
+            tk.Label(ext, text=titulo, bg=C["tarjeta"], fg=C["indigo"],
+                     font=(FUENTE, 11, "bold")).pack(anchor="w", padx=16, pady=(12, 6))
+            interior = tk.Frame(ext, bg=C["tarjeta"])
+            interior.pack(fill="both", expand=True, padx=16, pady=(0, 14))
+            # el empaquetado del marco exterior lo hace quien llama: reenviamos pack/grid
+            interior.pack = ext.pack
+            return interior
 
         # --- utilidades
         def escribir(self, s):
@@ -1039,10 +1535,19 @@ def gui():
             return next(k for k, v in MOTORES.items() if v == self.v_motor.get())
 
         def cambia_motor(self):
+            vx = self.motor() == "voxtral"
+            for fila in self.fila_vx:
+                for w in fila:
+                    w.grid() if vx else w.grid_remove()
             if self.motor() == "kokoro":
                 vals = [f"{k}  |  {v}" for k, v in VOCES.items()]
                 self.v_info.set("Rápido: Kokoro, pronuncia con la fonética de España (c/z como 'th'). "
                                 "Ideal para libros largos; funciona en CPU y GPU.")
+            elif vx:
+                vals = [f"{k}  |  {v}" for k, v in VX_VOCES.items()]
+                self.v_info.set("Voxtral (Mistral, 4B): voz muy natural, solo para uso personal (licencia no "
+                                "comercial). Se ejecuta en Unsloth Studio: ábrelo, carga Voxtral TTS y pega aquí "
+                                "la clave de Ajustes > API.")
             else:
                 vals = [f"{k}  |  {v['etiqueta']}" for k, v in CB_VOCES.items()]
                 self.v_info.set("Alta calidad: Chatterbox con el paquete de España. Imita la voz y el acento del "
@@ -1063,6 +1568,10 @@ def gui():
                                            filetypes=[("Audio", "*.wav *.mp3 *.flac *.m4a *.ogg"), ("Todos", "*.*")])
             if r:
                 self.v_ref.set(r)
+
+        def guardar_vx(self):
+            if self.motor() == "voxtral":
+                guardar_ajustes(vx_url=self.v_vx_url.get().strip(), vx_clave=self.v_vx_clave.get().strip())
 
         def formato(self):
             return next(k for k, v in FORMATOS.items() if v == self.v_fmt.get())
@@ -1110,8 +1619,9 @@ def gui():
         def poblar(self):
             self.tree.delete(*self.tree.get_children())
             for i, c in enumerate(self.libro.capitulos):
-                self.tree.insert("", "end", iid=str(i),
-                                 values=("[x]" if c.seleccionado else "[ ]", c.titulo, f"{c.chars:,}".replace(",", ".")))
+                self.tree.insert("", "end", iid=str(i), tags=("par" if i % 2 == 0 else "impar",),
+                                 values=(MARCA_SI if c.seleccionado else MARCA_NO, c.titulo,
+                                         f"{c.chars:,}".replace(",", ".")))
 
         def alternar(self, ev):
             iid = self.tree.identify_row(ev.y)
@@ -1119,7 +1629,7 @@ def gui():
                 return
             c = self.libro.capitulos[int(iid)]
             c.seleccionado = not c.seleccionado
-            self.tree.set(iid, "sel", "[x]" if c.seleccionado else "[ ]")
+            self.tree.set(iid, "sel", MARCA_SI if c.seleccionado else MARCA_NO)
 
         def marcar(self, v):
             if not self.libro or self.ocupado:
@@ -1138,6 +1648,7 @@ def gui():
                         largos = [p for p in c.parrafos if len(p) > 80]
                         texto = (largos or c.parrafos)[0][:400]
                         break
+            self.guardar_vx()
             voz, vel, gpu, ref = self.voz(), self.v_vel.get(), self.v_gpu.get(), self.v_ref.get()
             if voz == "cb:propia" and not ref:
                 messagebox.showinfo("Audiolibro", "Elige primero el audio de referencia.")
@@ -1164,6 +1675,7 @@ def gui():
             if self.voz() == "cb:propia" and not self.v_ref.get():
                 messagebox.showinfo("Audiolibro", "Elige primero el audio de referencia.")
                 return
+            self.guardar_vx()
             cfg = Config(voz=self.voz(), voz_ref=self.v_ref.get(), velocidad=round(self.v_vel.get(), 2),
                          formato=self.formato(), salida=self.v_salida.get() or ".",
                          usar_gpu=self.v_gpu.get(), leer_titulos=self.v_tit.get(),
@@ -1271,7 +1783,15 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Convierte EPUB/PDF/TXT en audiolibro (Kokoro rapido o Chatterbox alta calidad).")
     ap.add_argument("archivo", nargs="?", help="libro; si se omite se abre la interfaz")
     ap.add_argument("--voz", default="ef_dora",
-                    help="ef_dora, em_alex, em_santa (Kokoro) | cb:f1, cb:propia (Chatterbox alta calidad)")
+                    help="ef_dora, em_alex, em_santa (Kokoro) | cb:f1, cb:propia (Chatterbox alta calidad) | vx:es_female, vx:es_male (Voxtral)")
+    ap.add_argument("--vx-gguf", default="", help="ruta del GGUF de Voxtral TTS (si no se detecta solo)")
+    ap.add_argument("--vx-exe", default="", help="ruta de crispasr.exe (alternativa a Unsloth)")
+    ap.add_argument("--vx-url", default="", help="URL del servidor de Unsloth Studio, p. ej. http://127.0.0.1:8888")
+    ap.add_argument("--vx-clave", default="", help="clave API de Unsloth (Ajustes > API)")
+    ap.add_argument("--vx-modelo", default="", help="id del modelo en Unsloth (por defecto el primero con 'voxtral')")
+    ap.add_argument("--bench", action="store_true", help="mide la velocidad de Chatterbox por tamaño de lote")
+    ap.add_argument("--lote", default="", help="trozos a la vez en Chatterbox (con --bench, lista: 1,4,8,16)")
+    ap.add_argument("--vx-probar", action="store_true", help="muestra modelos y voces que ve el servidor de Unsloth")
     ap.add_argument("--voz-ref", default="", help="audio de referencia para --voz cb:propia")
     ap.add_argument("--listar-voces", action="store_true", help="muestra las voces disponibles")
     ap.add_argument("--muestra", metavar="SALIDA.wav", help="genera una muestra de la voz y termina")
@@ -1296,11 +1816,22 @@ def main(argv=None):
         return precargar()
     if a.precargar_hq:
         return precargar_hq()
+    if a.vx_gguf or a.vx_exe or a.vx_url or a.vx_clave or a.vx_modelo:
+        guardar_ajustes(vx_gguf=a.vx_gguf or None, vx_exe=a.vx_exe or None, vx_url=a.vx_url or None,
+                        vx_clave=a.vx_clave or None, vx_modelo=a.vx_modelo or None)
+    if a.vx_probar:
+        return sondear_voxtral(print)
+    if a.bench:
+        return bench([int(x) for x in (a.lote or "1,4,8").split(",")], not a.cpu, print)
+    if a.lote and "," not in a.lote:
+        os.environ["AUDIOLIBRO_LOTE"] = a.lote
     if a.listar_voces:
         for k, v in VOCES.items():
             print(f"{k:12s} Kokoro      {v}")
         for k, v in CB_VOCES.items():
             print(f"{k:12s} Chatterbox  {v['etiqueta']}")
+        for k, v in VX_VOCES.items():
+            print(f"{k:18s} Voxtral     {v}")
         return 0
     if a.muestra:
         texto = ("En un lugar de la Mancha, de cuyo nombre no quiero acordarme, no ha mucho tiempo que vivía "

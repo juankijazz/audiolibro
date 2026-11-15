@@ -21,3 +21,9 @@ python audiolibro.py --diagnostico      # comprueba la GPU y la velocidad real
 
 ## Integración continua
 Cada push ejecuta en Windows: pruebas, síntesis real con Kokoro (CPU), compilación del exe, prueba de extremo a extremo del exe y publicación en la release `latest`. El artefacto `muestra-voz-real` contiene el audio de prueba generado.
+
+## Motores de voz
+
+- **Rápido – Kokoro** (CPU o GPU): pronunciación de España.
+- **Alta calidad – Chatterbox España** (GPU): sintetiza 8 trozos a la vez (`AUDIOLIBRO_LOTE` o `--lote N`); `--bench --lote 1,4,8` mide la velocidad real.
+- **Voxtral (Mistral 4B)**: se ejecuta en **Unsloth Studio**. Carga el modelo en Studio, crea una clave en *Settings → API* y pega la URL (p. ej. `http://localhost:8888`) y la clave en la aplicación (o `--vx-url`, `--vx-clave`). `--vx-probar` muestra los modelos y voces que ve el servidor. Licencia CC BY-NC 4.0 (uso no comercial).
