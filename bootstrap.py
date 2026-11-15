@@ -23,7 +23,7 @@ import zipfile
 from pathlib import Path
 
 NOMBRE = "Audiolibro"
-SETUP_VERSION = "1"
+SETUP_VERSION = "2"
 INSTALL = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / NOMBRE
 APP = INSTALL / "app"
 VENV = INSTALL / "venv"
@@ -52,6 +52,8 @@ def copiar_app():
     APP.mkdir(parents=True, exist_ok=True)
     for f in ("audiolibro.py", "requirements.txt"):
         shutil.copy2(recurso(f), APP / f)
+    shutil.copytree(recurso("chatterbox"), APP / "chatterbox", dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns("__pycache__"))
 
 
 def instalado():
@@ -113,11 +115,11 @@ class Instalador:
         gpu = self.hay_gpu_nvidia()
         if gpu:
             self.log("GPU NVIDIA detectada: instalando PyTorch con CUDA 12.8 (descarga grande, paciencia)...")
-            self.ejecutar([UV, "pip", "install", "--python", VPY, "torch",
+            self.ejecutar([UV, "pip", "install", "--python", VPY, "torch", "torchaudio",
                            "--index-url", "https://download.pytorch.org/whl/cu128"])
         else:
             self.log("No se detecta GPU NVIDIA: se instala PyTorch para CPU.")
-            self.ejecutar([UV, "pip", "install", "--python", VPY, "torch"])
+            self.ejecutar([UV, "pip", "install", "--python", VPY, "torch", "torchaudio"])
         self.log("Instalando dependencias...")
         self.ejecutar([UV, "pip", "install", "--python", VPY, "-r", APP / "requirements.txt"])
         if gpu:

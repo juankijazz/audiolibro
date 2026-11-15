@@ -1,6 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Audiolibro: convierte EPUB / PDF / TXT en audiolibro (M4B o MP3) con Kokoro-82M.
+Audiolibro: convierte EPUB / PDF / TXT en audiolibro (M4B o MP3).
+
+Motores de voz (se elige en la interfaz):
+  - Rapido:        Kokoro-82M, pronunciacion castellana de Espana (CPU o GPU).
+  - Alta calidad:  Chatterbox Multilingual V3, paquete es-ES (castellano de Espana,
+                   clona la voz de una grabacion de referencia; recomendable GPU).
 
   - Sin argumentos        -> abre la interfaz grafica.
   - Con un archivo        -> modo consola (ver --help).
@@ -11,6 +16,7 @@ ningun estado global de PyTorch.
 """
 import argparse
 import hashlib
+import math
 import json
 import os
 import queue
@@ -23,18 +29,25 @@ import threading
 import time
 import traceback
 import unicodedata
+import zlib
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
+
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")     # sin consola (pythonw) no hay stderr
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+for _s in ("stdout", "stderr"):
+    if getattr(sys, _s) is None:
+        setattr(sys, _s, open(os.devnull, "w"))
 
 SAMPLE_RATE = 24000
 MAX_CHARS = 230          # tamano maximo de cada trozo enviado al modelo
 APP_DIR = Path(__file__).resolve().parent
 
 VOCES = {
-    "ef_dora": "Espanol - Dora (mujer)",
-    "em_alex": "Espanol - Alex (hombre)",
-    "em_santa": "Espanol - Santa (hombre)",
+    "ef_dora": "Español (pronunciación de España) - Dora, mujer",
+    "em_alex": "Español (pronunciación de España) - Alex, hombre",
+    "em_santa": "Español (pronunciación de España) - Santa, hombre",
     "pf_dora": "Portugues - Dora (mujer)",
     "pm_alex": "Portugues - Alex (hombre)",
     "ff_siwis": "Frances - Siwis (mujer)",
@@ -45,6 +58,16 @@ VOCES = {
     "bf_emma": "Ingles UK - Emma (mujer)",
     "bm_george": "Ingles UK - George (hombre)",
 }
+MOTORES = {
+    "kokoro": "Rápido - Kokoro (CPU o GPU)",
+    "chatterbox": "Alta calidad - Chatterbox España (GPU)",
+}
+REF_URL = "https://storage.googleapis.com/chatterbox-demo-samples/mtl-v3-single-language-prompts/es-es/"
+CB_VOCES = {
+    "cb:f1": {"etiqueta": "España (castellano) - mujer", "archivo": "es_es_f1.wav"},
+    "cb:propia": {"etiqueta": "Mi propia voz de referencia (elige un audio)", "archivo": None},
+}
+CB_EXAG, CB_CFG, CB_TEMP = 0.45, 0.5, 0.75   # narracion serena y estable
 FORMATOS = {
     "m4b": "M4B - un archivo con capitulos (recomendado)",
     "mp3": "MP3 - un solo archivo",
@@ -76,7 +99,9 @@ class Libro:
 
 @dataclass
 class Config:
-    voz: str = "ef_dora"
+    voz: str = "ef_dora"      # id de Kokoro (ef_dora...) o de Chatterbox (cb:f1, cb:propia)
+    voz_ref: str = ""         # audio de referencia para cb:propia
+    normalizar: bool = True   # volumen uniforme y limpieza de graves en el archivo final
     velocidad: float = 1.0
     formato: str = "m4b"
     salida: str = "."
@@ -171,7 +196,7 @@ def plan_capitulo(cap, leer_titulo):
         tit = limpiar_para_tts(cap.titulo).rstrip(".:") + "."
         for tz in trocear(tit):
             pl.append(("t", tz))
-        pl.append(("s", 1.0))
+        pl.append(("s", 1.2))
     for par in cap.parrafos:
         if ES_SEPARADOR.match(par.strip()):
             pl.append(("s", 1.2))
@@ -181,8 +206,9 @@ def plan_capitulo(cap, leer_titulo):
             continue
         for tz in trocear(txt):
             pl.append(("t", tz))
-            pl.append(("s", 0.15))
-        pl.append(("s", 0.55))
+            fin = re.search(r"[.!?…:»\"”)]$", tz.strip())
+            pl.append(("s", 0.35 if fin else 0.18))
+        pl.append(("s", 0.6))
     return pl
 
 
@@ -436,7 +462,14 @@ def info_gpu():
         return False, f"PyTorch no disponible: {e}"
 
 
-class Sintetizador:
+def _tono(texto):
+    import numpy as np
+    seg = max(0.3, len(texto) / 15.0)
+    t = np.arange(int(SAMPLE_RATE * seg)) / SAMPLE_RATE
+    return (0.2 * np.sin(2 * np.pi * 220 * t)).astype("float32")
+
+
+class SintKokoro:
     def __init__(self, voz, velocidad, usar_gpu=True, log=print, falso=False):
         self.voz, self.velocidad, self.falso, self.log = voz, velocidad, falso, log
         self.dispositivo = "falso"
@@ -461,9 +494,7 @@ class Sintetizador:
     def __call__(self, texto):
         import numpy as np
         if self.falso:
-            seg = max(0.3, len(texto) / 15.0)
-            t = np.arange(int(SAMPLE_RATE * seg)) / SAMPLE_RATE
-            return (0.2 * np.sin(2 * np.pi * 220 * t)).astype("float32")
+            return _tono(texto)
         partes = []
         with self.torch.inference_mode():
             for r in self.pipe(texto, voice=self.voz, speed=self.velocidad, split_pattern=None):
@@ -477,6 +508,181 @@ class Sintetizador:
             self.vacios += 1
             return np.zeros(0, dtype="float32")
         return np.concatenate(partes)
+
+# ----------------------------------------------------------------------------
+# Motor de alta calidad: Chatterbox Multilingual V3 (paquete es-ES)
+# ----------------------------------------------------------------------------
+def _dir_datos():
+    base = os.environ.get("AUDIOLIBRO_DATOS")
+    if base:
+        return Path(base)
+    if os.name == "nt":
+        return Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "Audiolibro"
+    return Path.home() / ".audiolibro"
+
+
+DIR_MODELOS = _dir_datos() / "modelos"
+
+
+def motor_de(voz):
+    return "chatterbox" if str(voz).startswith("cb:") else "kokoro"
+
+
+def descargar(url, dest):
+    import urllib.request
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    req = urllib.request.Request(url, headers={"User-Agent": "Audiolibro/2"})
+    with urllib.request.urlopen(req, timeout=60) as r, open(tmp, "wb") as f:
+        shutil.copyfileobj(r, f)
+    tmp.replace(dest)
+
+
+def referencia_cb(voz, voz_ref, log=print):
+    """Ruta del audio de referencia que define la voz (y el acento) de Chatterbox."""
+    if voz == "cb:propia":
+        if not voz_ref or not Path(voz_ref).is_file():
+            raise ValueError("Elige un audio de referencia (WAV, MP3 o FLAC de unos 10 segundos "
+                             "con la voz que quieres imitar).")
+        return str(voz_ref)
+    info = CB_VOCES.get(voz)
+    if not info or not info["archivo"]:
+        raise ValueError(f"Voz desconocida: {voz}")
+    dest = DIR_MODELOS / "voces" / info["archivo"]
+    if not dest.exists():
+        log("Descargando la voz de referencia de España...")
+        descargar(REF_URL + info["archivo"], dest)
+    return str(dest)
+
+
+def cargar_chatterbox(dispositivo, log=print):
+    """Monta el modelo es-ES: T3 propio de España + decodificador V3 (o el estandar si no encaja)."""
+    import torch
+    from huggingface_hub import hf_hub_download
+    from safetensors.torch import load_file
+    from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+    from chatterbox.models.t3 import T3
+    from chatterbox.models.t3.modules.t3_config import T3Config
+    from chatterbox.models.s3gen import S3Gen
+    from chatterbox.models.tokenizers import MTLTokenizer
+    from chatterbox.models.voice_encoder import VoiceEncoder
+
+    carpeta = DIR_MODELOS / "chatterbox-es"
+    carpeta.mkdir(parents=True, exist_ok=True)
+    base, es = "ResembleAI/chatterbox", "ResembleAI/Chatterbox-Multilingual-es-es"
+
+    def bajar(repo, nombre, aviso=None):
+        dest = carpeta / nombre
+        if not dest.exists():
+            log(aviso or f"Descargando {nombre} ...")
+            hf_hub_download(repo, nombre, local_dir=str(carpeta))
+        return dest
+
+    log("Preparando el modelo de alta calidad (la primera vez descarga unos 4,3 GB; solo una vez)...")
+    ve_p = bajar(base, "ve.pt")
+    tok_p = bajar(es, "grapheme_mtl_merged_expanded_v1.json")
+    t3_p = bajar(es, "t3_es_es.safetensors", "Descargando el modelo de España (2,1 GB)...")
+    mapa = torch.device("cpu") if dispositivo == "cpu" else None
+
+    ve = VoiceEncoder()
+    ve.load_state_dict(torch.load(str(ve_p), map_location=mapa, weights_only=True))
+    ve.to(dispositivo).eval()
+
+    t3 = T3(T3Config.multilingual())
+    est = load_file(str(t3_p))
+    if "model" in est:
+        est = est["model"][0]
+    t3.load_state_dict(est)
+    t3.to(dispositivo).eval()
+
+    s3gen = S3Gen()
+    try:
+        s3_p = bajar(es, "s3gen_v3.safetensors", "Descargando el decodificador de voz V3 (1,1 GB)...")
+        s3gen.load_state_dict(load_file(str(s3_p)))
+        log("Decodificador V3 cargado.")
+    except Exception as e:
+        log(f"Aviso: el decodificador V3 no encaja ({type(e).__name__}); se usa el estándar.")
+        s3gen = S3Gen()
+        s3_p = bajar(base, "s3gen.pt", "Descargando el decodificador estándar (1 GB)...")
+        s3gen.load_state_dict(torch.load(str(s3_p), map_location=mapa, weights_only=True))
+    s3gen.to(dispositivo).eval()
+
+    tok = MTLTokenizer(str(tok_p))
+    return ChatterboxMultilingualTTS(t3, s3gen, ve, tok, dispositivo, conds=None)
+
+
+class SintChatterbox:
+    def __init__(self, voz, velocidad, usar_gpu=True, log=print, falso=False, voz_ref=""):
+        self.voz, self.velocidad, self.falso, self.log = voz, velocidad, falso, log
+        self.dispositivo = "falso"
+        self.vacios = 0
+        self.reintentos = 0
+        if falso:
+            return
+        import torch
+        self.torch = torch
+        gpu_ok = torch.cuda.is_available()
+        if usar_gpu and not gpu_ok:
+            log("AVISO: se pidio GPU pero PyTorch no la ve; se usa la CPU (muy lento con este modelo).")
+        self.dispositivo = "cuda" if (usar_gpu and gpu_ok) else "cpu"
+        ref = referencia_cb(voz, voz_ref, log)
+        clave = ("chatterbox", self.dispositivo)
+        if clave not in _PIPES:
+            _PIPES[clave] = cargar_chatterbox(self.dispositivo, log)
+        self.m = _PIPES[clave]
+        self.m.prepare_conditionals(ref, exaggeration=CB_EXAG)
+        nombre = torch.cuda.get_device_name(0) if self.dispositivo == "cuda" else "CPU"
+        log(f"Sintetizando en: {self.dispositivo.upper()} ({nombre}) - motor de alta calidad")
+
+    def __call__(self, texto):
+        import numpy as np
+        if self.falso:
+            return _tono(texto)
+        esperado = max(1.0, len(texto) / 15.0)        # ~15 caracteres por segundo al narrar
+        mejor, mejor_err = None, None
+        for intento in range(3):
+            self.torch.manual_seed(zlib.crc32(texto.encode("utf-8")) + intento)
+            with self.torch.inference_mode():
+                w = self.m.generate(texto, language_id="es", exaggeration=CB_EXAG,
+                                    cfg_weight=CB_CFG, temperature=CB_TEMP)
+            a = np.asarray(w.detach().cpu().numpy(), dtype="float32").reshape(-1)
+            dur = len(a) / SAMPLE_RATE
+            err = abs(math.log(max(dur, 0.05) / esperado))
+            if mejor is None or err < mejor_err:
+                mejor, mejor_err = a, err
+            if 0.4 * esperado - 0.5 <= dur <= 2.0 * esperado + 1.0:
+                break                                  # duracion plausible: sin alucinaciones
+            self.reintentos += 1
+        if mejor is None or not len(mejor):
+            self.vacios += 1
+            return np.zeros(0, dtype="float32")
+        return mejor
+
+
+def Sintetizador(voz, velocidad, usar_gpu=True, log=print, falso=False, voz_ref=""):
+    if motor_de(voz) == "chatterbox":
+        return SintChatterbox(voz, velocidad, usar_gpu, log, falso, voz_ref)
+    return SintKokoro(voz, velocidad, usar_gpu, log, falso)
+
+
+def acondicionar(a):
+    """Quita la componente continua, recorta el silencio sobrante y suaviza los bordes (sin clics)."""
+    import numpy as np
+    if len(a) == 0:
+        return a
+    a = a - float(np.median(a))
+    idx = np.flatnonzero(np.abs(a) > 10 ** (-52 / 20))
+    if len(idx) == 0:
+        return a[:0]
+    margen = int(0.04 * SAMPLE_RATE)
+    a = a[max(0, idx[0] - margen): min(len(a), idx[-1] + margen)].copy()
+    n = min(len(a) // 2, int(0.008 * SAMPLE_RATE))
+    if n > 1:
+        r = np.linspace(0.0, 1.0, n, dtype="float32")
+        a[:n] *= r
+        a[-n:] *= r[::-1]
+    return a
 
 
 def nombre_seguro(s):
@@ -507,15 +713,29 @@ def _esc_meta(s):
     return re.sub(r"([=;#\\\n])", r"\\\1", s or "")
 
 
+def _filtro_audio(cfg):
+    f = []
+    if cfg.normalizar:
+        f.append("highpass=f=70")
+    atempo = motor_de(cfg.voz) == "chatterbox" and abs(cfg.velocidad - 1.0) > 0.01
+    if atempo:
+        f.append(f"atempo={cfg.velocidad:.3f}")
+    if cfg.normalizar:
+        f.append("loudnorm=I=-19:TP=-1.5:LRA=9")
+    af = ["-af", ",".join(f), "-ar", str(SAMPLE_RATE)] if f else []
+    return af, (1.0 / cfg.velocidad if atempo else 1.0)
+
+
 def ensamblar(wavs, titulos, libro, cfg, out_dir, base, log):
     import soundfile as sf
     ff = _ffmpeg()
+    af, escala_t = _filtro_audio(cfg)
     if cfg.formato == "mp3-caps":
         carpeta = out_dir / base
         carpeta.mkdir(exist_ok=True)
         for i, (w, t) in enumerate(zip(wavs, titulos), 1):
             dest = carpeta / f"{i:02d} - {nombre_seguro(t) or 'capitulo'}.mp3"
-            _run([ff, "-y", "-i", str(w), "-c:a", "libmp3lame", "-q:a", "4",
+            _run([ff, "-y", "-i", str(w)] + af + ["-c:a", "libmp3lame", "-q:a", "4",
                   "-metadata", f"title={t}", "-metadata", f"album={libro.titulo}",
                   "-metadata", f"artist={libro.autor}", "-metadata", f"track={i}", str(dest)])
         return carpeta
@@ -525,23 +745,24 @@ def ensamblar(wavs, titulos, libro, cfg, out_dir, base, log):
     try:
         if cfg.formato == "mp3":
             dest = out_dir / (base + ".mp3")
-            _run([ff, "-y", "-f", "concat", "-safe", "0", "-i", str(lista), "-c:a", "libmp3lame",
-                  "-q:a", "4", "-metadata", f"title={libro.titulo}", "-metadata", f"artist={libro.autor}",
-                  str(dest)])
+            _run([ff, "-y", "-f", "concat", "-safe", "0", "-i", str(lista)] + af +
+                 ["-c:a", "libmp3lame", "-q:a", "4", "-metadata", f"title={libro.titulo}",
+                  "-metadata", f"artist={libro.autor}", str(dest)])
             return dest
         meta = out_dir / (base + "_meta.txt")
         L = [";FFMETADATA1", f"title={_esc_meta(libro.titulo)}", f"artist={_esc_meta(libro.autor)}",
              f"album={_esc_meta(libro.titulo)}", "genre=Audiobook"]
         t_ms = 0
         for w, t in zip(wavs, titulos):
-            dur = int(round(sf.info(str(w)).duration * 1000))
+            dur = int(round(sf.info(str(w)).duration * 1000 * escala_t))
             L += ["[CHAPTER]", "TIMEBASE=1/1000", f"START={t_ms}", f"END={t_ms + dur}",
                   f"title={_esc_meta(t)}"]
             t_ms += dur
         meta.write_text("\n".join(L) + "\n", encoding="utf-8")
         dest = out_dir / (base + ".m4b")
         _run([ff, "-y", "-f", "concat", "-safe", "0", "-i", str(lista), "-i", str(meta),
-              "-map", "0:a", "-map_metadata", "1", "-c:a", "aac", "-b:a", "64k", "-ac", "1",
+              "-map", "0:a", "-map_metadata", "1"] + af +
+             ["-c:a", "aac", "-b:a", "64k", "-ac", "1",
               "-movflags", "+faststart", "-f", "ipod", str(dest)])
         meta.unlink(missing_ok=True)
         return dest
@@ -573,12 +794,14 @@ def convertir(libro, cfg, log=print, progreso=None, cancel=None):
     total = max(1, sum(chars.values()))
     log(f"{len(caps)} capitulos, {total:,} caracteres a locutar.".replace(",", "."))
 
-    sint = Sintetizador(cfg.voz, cfg.velocidad, cfg.usar_gpu, log, cfg.falso)
+    sint = Sintetizador(cfg.voz, cfg.velocidad, cfg.usar_gpu, log, cfg.falso, cfg.voz_ref)
+    nativa = motor_de(cfg.voz) == "kokoro"          # Kokoro aplica la velocidad al sintetizar
     hecho = sesion = 0
     t0 = time.time()
     wavs, titulos = [], []
     for n, (i, c) in enumerate(caps, 1):
-        firma = hashlib.sha1(json.dumps([planes[i], cfg.voz, cfg.velocidad]).encode()).hexdigest()[:8]
+        firma = hashlib.sha1(json.dumps([planes[i], cfg.voz, cfg.velocidad if nativa else 0,
+                                         cfg.voz_ref if cfg.voz == "cb:propia" else "", 2]).encode()).hexdigest()[:8]
         wav = trabajo / f"cap_{i + 1:03d}_{firma}.wav"
         titulos.append(c.titulo)
         wavs.append(wav)
@@ -597,7 +820,7 @@ def convertir(libro, cfg, log=print, progreso=None, cancel=None):
                 if k == "s":
                     f.write(np.zeros(int(SAMPLE_RATE * v), dtype="float32"))
                     continue
-                a = sint(v)
+                a = acondicionar(sint(v))
                 if len(a):
                     f.write(np.clip(a, -1.0, 1.0))
                 hecho += len(v)
@@ -608,6 +831,8 @@ def convertir(libro, cfg, log=print, progreso=None, cancel=None):
         tmp.replace(wav)
     if sint.vacios:
         log(f"Aviso: {sint.vacios} trozos no produjeron audio (texto sin pronunciacion).")
+    if getattr(sint, "reintentos", 0):
+        log(f"Se repitieron {sint.reintentos} trozos con duracion anomala (control anti-alucinaciones).")
     progreso(1.0, "Codificando el audiolibro...")
     log("Codificando el archivo final...")
     dest = ensamblar(wavs, titulos, libro, cfg, out_dir, base, log)
@@ -618,12 +843,15 @@ def convertir(libro, cfg, log=print, progreso=None, cancel=None):
     return dest
 
 
-def generar_muestra(texto, voz, velocidad, usar_gpu, log=print, falso=False):
+def generar_muestra(texto, voz, velocidad, usar_gpu, log=print, falso=False, voz_ref="", destino=None):
     import numpy as np
     import soundfile as sf
-    sint = Sintetizador(voz, velocidad, usar_gpu, log, falso)
-    partes = [sint(t) for t in trocear(limpiar_para_tts(texto))[:2]]
-    ruta = Path(tempfile.gettempdir()) / "audiolibro_muestra.wav"
+    sint = Sintetizador(voz, velocidad, usar_gpu, log, falso, voz_ref)
+    partes = []
+    for t in trocear(limpiar_para_tts(texto))[:2]:
+        partes += [acondicionar(sint(t)), np.zeros(int(SAMPLE_RATE * 0.3), dtype="float32")]
+    ruta = Path(destino) if destino else Path(tempfile.gettempdir()) / "audiolibro_muestra.wav"
+    ruta.parent.mkdir(parents=True, exist_ok=True)
     sf.write(str(ruta), np.clip(np.concatenate(partes), -1, 1), SAMPLE_RATE, subtype="PCM_16")
     return ruta
 
@@ -648,6 +876,13 @@ def diagnostico():
     print(f"{seg_audio:.1f} s de audio generados en {dt:.1f} s -> {seg_audio / dt:.1f}x tiempo real")
     if sint.dispositivo == "cuda" and seg_audio / dt < 10:
         print("Aviso: va mas lento de lo esperable para una GPU; cierra otros programas que la usen.")
+    return 0
+
+
+def precargar_hq():
+    print("Descargando el modelo de alta calidad (unos 4,3 GB, solo la primera vez)...")
+    cargar_chatterbox("cpu", print)
+    print("Modelo de alta calidad listo.")
     return 0
 
 
@@ -677,8 +912,8 @@ def gui():
         def __init__(self, root):
             self.root = root
             root.title("Audiolibro - EPUB / PDF / TXT a audio")
-            root.geometry("900x720")
-            root.minsize(820, 640)
+            root.geometry("900x780")
+            root.minsize(820, 700)
             self.q = queue.Queue()
             self.libro = None
             self.cancel = threading.Event()
@@ -687,7 +922,11 @@ def gui():
 
             self.v_archivo = tk.StringVar()
             self.v_salida = tk.StringVar()
+            self.v_motor = tk.StringVar(value=MOTORES["kokoro"])
             self.v_voz = tk.StringVar(value=f"ef_dora  |  {VOCES['ef_dora']}")
+            self.v_ref = tk.StringVar(value="")
+            self.v_info = tk.StringVar(value="")
+            self.v_norm = tk.BooleanVar(value=True)
             self.v_vel = tk.DoubleVar(value=1.0)
             self.v_fmt = tk.StringVar(value=FORMATOS["m4b"])
             self.v_gpu = tk.BooleanVar(value=True)
@@ -727,29 +966,44 @@ def gui():
             op = ttk.LabelFrame(f, text="Opciones", padding=8)
             op.grid(row=3, column=0, columnspan=4, sticky="ew", pady=6)
             op.columnconfigure(1, weight=1)
-            ttk.Label(op, text="Voz:").grid(row=0, column=0, sticky="w")
-            self.cb_voz = ttk.Combobox(op, textvariable=self.v_voz, state="readonly", width=42,
-                                       values=[f"{k}  |  {v}" for k, v in VOCES.items()])
-            self.cb_voz.grid(row=0, column=1, sticky="w", padx=6)
-            ttk.Button(op, text="Escuchar muestra", command=self.muestra).grid(row=0, column=2, padx=6)
-            ttk.Label(op, text="Velocidad:").grid(row=1, column=0, sticky="w", pady=4)
+            ttk.Label(op, text="Motor:").grid(row=0, column=0, sticky="w")
+            self.cb_motor = ttk.Combobox(op, textvariable=self.v_motor, state="readonly", width=42,
+                                         values=list(MOTORES.values()))
+            self.cb_motor.grid(row=0, column=1, sticky="w", padx=6, pady=2)
+            self.cb_motor.bind("<<ComboboxSelected>>", lambda e: self.cambia_motor())
+            ttk.Label(op, text="Voz:").grid(row=1, column=0, sticky="w")
+            self.cb_voz = ttk.Combobox(op, textvariable=self.v_voz, state="readonly", width=60)
+            self.cb_voz.grid(row=1, column=1, sticky="w", padx=6, pady=2)
+            self.cb_voz.bind("<<ComboboxSelected>>", lambda e: self.cambia_voz())
+            ttk.Button(op, text="Escuchar muestra", command=self.muestra).grid(row=1, column=2, padx=6)
+            ttk.Label(op, text="Audio de referencia:").grid(row=2, column=0, sticky="w")
+            self.en_ref = ttk.Entry(op, textvariable=self.v_ref, state="readonly")
+            self.en_ref.grid(row=2, column=1, sticky="ew", padx=6, pady=2)
+            self.bt_ref = ttk.Button(op, text="Elegir...", command=self.elegir_ref)
+            self.bt_ref.grid(row=2, column=2, padx=6)
+            ttk.Label(op, textvariable=self.v_info, foreground="#555", wraplength=760,
+                      justify="left").grid(row=3, column=0, columnspan=3, sticky="w", pady=(2, 4))
+            ttk.Label(op, text="Velocidad:").grid(row=4, column=0, sticky="w", pady=4)
             fv = ttk.Frame(op)
-            fv.grid(row=1, column=1, sticky="w", padx=6)
+            fv.grid(row=4, column=1, sticky="w", padx=6)
             ttk.Scale(fv, from_=0.7, to=1.4, variable=self.v_vel, length=200,
                       command=lambda _=None: self.lbl_vel.config(text=f"{self.v_vel.get():.2f}x")).pack(side="left")
             self.lbl_vel = ttk.Label(fv, text="1.00x", width=6)
             self.lbl_vel.pack(side="left", padx=6)
-            ttk.Label(op, text="Formato:").grid(row=2, column=0, sticky="w")
+            ttk.Label(op, text="Formato:").grid(row=5, column=0, sticky="w")
             ttk.Combobox(op, textvariable=self.v_fmt, state="readonly", width=42,
-                         values=list(FORMATOS.values())).grid(row=2, column=1, sticky="w", padx=6, pady=2)
-            ttk.Label(op, text="Guardar en:").grid(row=3, column=0, sticky="w", pady=4)
-            ttk.Entry(op, textvariable=self.v_salida).grid(row=3, column=1, sticky="ew", padx=6)
-            ttk.Button(op, text="Cambiar...", command=self.elegir_salida).grid(row=3, column=2, padx=6)
+                         values=list(FORMATOS.values())).grid(row=5, column=1, sticky="w", padx=6, pady=2)
+            ttk.Label(op, text="Guardar en:").grid(row=6, column=0, sticky="w", pady=4)
+            ttk.Entry(op, textvariable=self.v_salida).grid(row=6, column=1, sticky="ew", padx=6)
+            ttk.Button(op, text="Cambiar...", command=self.elegir_salida).grid(row=6, column=2, padx=6)
             self.chk_gpu = ttk.Checkbutton(op, text="Usar la GPU (CUDA)", variable=self.v_gpu)
-            self.chk_gpu.grid(row=4, column=0, columnspan=2, sticky="w")
-            ttk.Label(op, textvariable=self.v_gpu_txt, foreground="#555").grid(row=4, column=1, columnspan=2, sticky="e")
+            self.chk_gpu.grid(row=7, column=0, columnspan=2, sticky="w")
+            ttk.Label(op, textvariable=self.v_gpu_txt, foreground="#555").grid(row=7, column=1, columnspan=2, sticky="e")
             ttk.Checkbutton(op, text="Leer en voz alta el titulo de cada capitulo",
-                            variable=self.v_tit).grid(row=5, column=0, columnspan=3, sticky="w")
+                            variable=self.v_tit).grid(row=8, column=0, columnspan=3, sticky="w")
+            ttk.Checkbutton(op, text="Audio limpio: volumen uniforme y sin graves molestos",
+                            variable=self.v_norm).grid(row=9, column=0, columnspan=3, sticky="w")
+            self.cambia_motor()
 
             ac = ttk.Frame(f)
             ac.grid(row=4, column=0, columnspan=4, sticky="ew", pady=4)
@@ -776,6 +1030,35 @@ def gui():
 
         def voz(self):
             return self.v_voz.get().split("|")[0].strip()
+
+        def motor(self):
+            return next(k for k, v in MOTORES.items() if v == self.v_motor.get())
+
+        def cambia_motor(self):
+            if self.motor() == "kokoro":
+                vals = [f"{k}  |  {v}" for k, v in VOCES.items()]
+                self.v_info.set("Rápido: Kokoro, pronuncia con la fonética de España (c/z como 'th'). "
+                                "Ideal para libros largos; funciona en CPU y GPU.")
+            else:
+                vals = [f"{k}  |  {v['etiqueta']}" for k, v in CB_VOCES.items()]
+                self.v_info.set("Alta calidad: Chatterbox con el paquete de España. Imita la voz y el acento del "
+                                "audio de referencia (puedes poner el tuyo). Más lento y necesita GPU; la primera "
+                                "vez descarga unos 4,3 GB.")
+            self.cb_voz.config(values=vals)
+            self.v_voz.set(vals[0])
+            self.cambia_voz()
+
+        def cambia_voz(self):
+            propia = self.voz() == "cb:propia"
+            self.bt_ref.config(state="normal" if propia else "disabled")
+            if not propia:
+                self.v_ref.set("")
+
+        def elegir_ref(self):
+            r = filedialog.askopenfilename(title="Audio de referencia (voz a imitar, ~10 s)",
+                                           filetypes=[("Audio", "*.wav *.mp3 *.flac *.m4a *.ogg"), ("Todos", "*.*")])
+            if r:
+                self.v_ref.set(r)
 
         def formato(self):
             return next(k for k, v in FORMATOS.items() if v == self.v_fmt.get())
@@ -851,14 +1134,17 @@ def gui():
                         largos = [p for p in c.parrafos if len(p) > 80]
                         texto = (largos or c.parrafos)[0][:400]
                         break
-            voz, vel, gpu = self.voz(), self.v_vel.get(), self.v_gpu.get()
+            voz, vel, gpu, ref = self.voz(), self.v_vel.get(), self.v_gpu.get(), self.v_ref.get()
+            if voz == "cb:propia" and not ref:
+                messagebox.showinfo("Audiolibro", "Elige primero el audio de referencia.")
+                return
             self.bloquear(True)
             self.btn_stop.config(state="disabled")
             self.v_estado.set("Generando muestra...")
 
             def trabajo():
                 try:
-                    r = generar_muestra(texto, voz, vel, gpu, lambda s: self.q.put(("log", s)))
+                    r = generar_muestra(texto, voz, vel, gpu, lambda s: self.q.put(("log", s)), voz_ref=ref)
                     self.q.put(("muestra", str(r)))
                 except Exception:
                     self.q.put(("error", traceback.format_exc()))
@@ -871,9 +1157,13 @@ def gui():
             if not any(c.seleccionado for c in self.libro.capitulos):
                 messagebox.showinfo("Audiolibro", "Marca al menos un capitulo.")
                 return
-            cfg = Config(voz=self.voz(), velocidad=round(self.v_vel.get(), 2), formato=self.formato(),
-                         salida=self.v_salida.get() or ".", usar_gpu=self.v_gpu.get(),
-                         leer_titulos=self.v_tit.get())
+            if self.voz() == "cb:propia" and not self.v_ref.get():
+                messagebox.showinfo("Audiolibro", "Elige primero el audio de referencia.")
+                return
+            cfg = Config(voz=self.voz(), voz_ref=self.v_ref.get(), velocidad=round(self.v_vel.get(), 2),
+                         formato=self.formato(), salida=self.v_salida.get() or ".",
+                         usar_gpu=self.v_gpu.get(), leer_titulos=self.v_tit.get(),
+                         normalizar=self.v_norm.get())
             self.cancel.clear()
             self.bloquear(True)
             self.pb["value"] = 0
@@ -974,9 +1264,15 @@ def main(argv=None):
             s.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
-    ap = argparse.ArgumentParser(description="Convierte EPUB/PDF/TXT en audiolibro con Kokoro (GPU).")
+    ap = argparse.ArgumentParser(description="Convierte EPUB/PDF/TXT en audiolibro (Kokoro rapido o Chatterbox alta calidad).")
     ap.add_argument("archivo", nargs="?", help="libro; si se omite se abre la interfaz")
-    ap.add_argument("--voz", default="ef_dora", help="ef_dora, em_alex, em_santa, ... (por defecto ef_dora)")
+    ap.add_argument("--voz", default="ef_dora",
+                    help="ef_dora, em_alex, em_santa (Kokoro) | cb:f1, cb:propia (Chatterbox alta calidad)")
+    ap.add_argument("--voz-ref", default="", help="audio de referencia para --voz cb:propia")
+    ap.add_argument("--listar-voces", action="store_true", help="muestra las voces disponibles")
+    ap.add_argument("--muestra", metavar="SALIDA.wav", help="genera una muestra de la voz y termina")
+    ap.add_argument("--sin-normalizar", action="store_true", help="no normalizar el volumen del archivo final")
+    ap.add_argument("--precargar-hq", action="store_true", help="descarga el modelo de alta calidad")
     ap.add_argument("--velocidad", type=float, default=1.0)
     ap.add_argument("--formato", choices=list(FORMATOS), default="m4b")
     ap.add_argument("--salida", help="carpeta de salida (por defecto, junto al libro)")
@@ -994,6 +1290,21 @@ def main(argv=None):
         return diagnostico()
     if a.precargar:
         return precargar()
+    if a.precargar_hq:
+        return precargar_hq()
+    if a.listar_voces:
+        for k, v in VOCES.items():
+            print(f"{k:12s} Kokoro      {v}")
+        for k, v in CB_VOCES.items():
+            print(f"{k:12s} Chatterbox  {v['etiqueta']}")
+        return 0
+    if a.muestra:
+        texto = ("En un lugar de la Mancha, de cuyo nombre no quiero acordarme, no ha mucho tiempo que vivía "
+                 "un hidalgo de los de lanza en astillero, adarga antigua, rocín flaco y galgo corredor. "
+                 "Zaragoza, cielo y gracias: así suena el castellano de España.")
+        r = generar_muestra(texto, a.voz, a.velocidad, not a.cpu, print, a.falso, a.voz_ref, a.muestra)
+        print(f"Muestra guardada en {r}")
+        return 0
     if not a.archivo:
         try:
             gui()
@@ -1017,7 +1328,8 @@ def main(argv=None):
         for i, c in enumerate(libro.capitulos, 1):
             print(f"{i:3d} [{'x' if c.seleccionado else ' '}] {c.chars:>8,}  {c.titulo}".replace(",", "."))
         return 0
-    cfg = Config(voz=a.voz, velocidad=a.velocidad, formato=a.formato,
+    cfg = Config(voz=a.voz, voz_ref=a.voz_ref, normalizar=not a.sin_normalizar,
+                 velocidad=a.velocidad, formato=a.formato,
                  salida=a.salida or str(Path(a.archivo).resolve().parent),
                  usar_gpu=not a.cpu, leer_titulos=not a.sin_titulos,
                  conservar_temporal=a.conservar_temporal, falso=a.falso)

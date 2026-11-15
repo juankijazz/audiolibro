@@ -32,6 +32,36 @@ jobs:
       - name: Diagnostico
         run: python audiolibro.py --diagnostico
         continue-on-error: true
+      - name: Muestras de voz Kokoro (escuchar el acento)
+        run: |
+          python audiolibro.py --muestra muestras_voz/kokoro_ef_dora.wav --voz ef_dora --cpu
+          python audiolibro.py --muestra muestras_voz/kokoro_em_alex.wav --voz em_alex --cpu
+          python audiolibro.py --muestra muestras_voz/kokoro_em_santa.wav --voz em_santa --cpu
+      - name: Voces de referencia de España (sondeo de las disponibles)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force muestras_voz\referencias | Out-Null
+          $base = "https://storage.googleapis.com/chatterbox-demo-samples/mtl-v3-single-language-prompts/es-es/"
+          foreach ($n in "es_es_f1","es_es_f2","es_es_f3","es_es_m1","es_es_m2","es_es_m3") {
+            try {
+              Invoke-WebRequest -Uri "$base$n.wav" -OutFile "muestras_voz\referencias\$n.wav" -ErrorAction Stop
+              Write-Host "OK  $n.wav"
+            } catch { Write-Host "NO  $n.wav" }
+          }
+      - name: Cache del modelo de alta calidad
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\Audiolibro\modelos
+          key: chatterbox-es-v1
+      - name: Sintesis REAL con Chatterbox España (CPU, una muestra corta)
+        timeout-minutes: 40
+        run: |
+          python audiolibro.py --muestra muestras_voz/chatterbox_es_f1.wav --voz cb:f1 --cpu
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: muestras-de-voz
+          path: muestras_voz
       - uses: actions/upload-artifact@v4
         with:
           name: muestra-voz-real
@@ -49,7 +79,7 @@ jobs:
       - name: Compilar con PyInstaller
         run: |
           pip install pyinstaller
-          pyinstaller --noconfirm --onefile --windowed --name Audiolibro --add-data "audiolibro.py;." --add-data "requirements.txt;." bootstrap.py
+          pyinstaller --noconfirm --onefile --windowed --name Audiolibro --add-data "audiolibro.py;." --add-data "requirements.txt;." --add-data "chatterbox;chatterbox" bootstrap.py
       - uses: actions/upload-artifact@v4
         with:
           name: Audiolibro-exe
