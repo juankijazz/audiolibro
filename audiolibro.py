@@ -1375,8 +1375,8 @@ def gui():
         def __init__(self, root):
             self.root = root
             root.title("Audiolibro - EPUB / PDF / TXT a audio")
-            root.geometry("1120x780")
-            root.minsize(1000, 700)
+            root.geometry("1120x700")
+            root.minsize(980, 560)
             root.configure(bg=C["fondo"])
             self.q = queue.Queue()
             self.libro = None
@@ -1410,7 +1410,7 @@ def gui():
             tk.Frame(root, bg=C["sol"], height=4).pack(fill="x")
 
             cuerpo = tk.Frame(root, bg=C["fondo"])
-            cuerpo.pack(fill="both", expand=True, padx=20, pady=(14, 16))
+            cuerpo.pack(fill="both", expand=True, padx=20, pady=(12, 10))
             cuerpo.columnconfigure(0, weight=11, uniform="c")
             cuerpo.columnconfigure(1, weight=10, uniform="c")
             cuerpo.rowconfigure(0, weight=1)
@@ -1436,7 +1436,7 @@ def gui():
             t2.columnconfigure(0, weight=1)
             t2.rowconfigure(0, weight=1)
             cols = ("sel", "titulo", "chars")
-            self.tree = ttk.Treeview(t2, columns=cols, show="headings", height=9, selectmode="none",
+            self.tree = ttk.Treeview(t2, columns=cols, show="headings", height=6, selectmode="none",
                                      style="Cap.Treeview")
             self.tree.heading("sel", text="Leer")
             self.tree.heading("titulo", text="Capítulo")
@@ -1532,7 +1532,7 @@ def gui():
 
             # --- accion, progreso y registro (ancho completo)
             pie = tk.Frame(root, bg=C["fondo"])
-            pie.pack(fill="x", padx=20, pady=(0, 16))
+            pie.pack(fill="x", padx=20, pady=(0, 12))
             pie.columnconfigure(0, weight=1)
             ac = tk.Frame(pie, bg=C["fondo"])
             ac.grid(row=0, column=0, sticky="ew")
@@ -1545,11 +1545,14 @@ def gui():
             ttk.Label(ac, textvariable=self.v_estado, style="Estado.TLabel").pack(side="left", padx=8)
             self.pb = ttk.Progressbar(pie, maximum=1000, style="Acento.Horizontal.TProgressbar")
             self.pb.grid(row=1, column=0, sticky="ew", pady=(10, 8))
-            self.log = tk.Text(pie, height=6, state="disabled", wrap="word", font=("Consolas", 9),
+            self.log = tk.Text(pie, height=5, state="disabled", wrap="word", font=("Consolas", 9),
                                bg=C["tarjeta"], fg=C["texto"], relief="flat", bd=0, padx=10, pady=8,
                                highlightthickness=1, highlightbackground=C["borde"],
                                highlightcolor=C["borde"])
             self.log.grid(row=2, column=0, sticky="ew")
+            sb_log = ttk.Scrollbar(pie, orient="vertical", command=self.log.yview)
+            self.log.configure(yscrollcommand=sb_log.set)
+            sb_log.grid(row=2, column=1, sticky="ns")
 
             threading.Thread(target=self._detectar_gpu, daemon=True).start()
             root.after(100, self._poll)
@@ -1840,6 +1843,12 @@ def gui():
                             self.v_estado.set("Unsloth no lista voces propias: se usan las predefinidas de Voxtral.")
                     elif k == "vx_diag":
                         self.escribir(m[1])
+                        try:
+                            self.root.clipboard_clear()
+                            self.root.clipboard_append(m[1])
+                            self.v_estado.set("Diagnóstico copiado al portapapeles: pégalo en el chat.")
+                        except Exception:
+                            pass
                     elif k == "vx_error":
                         self.v_estado.set("No se pudieron cargar las voces.")
                         self.escribir(m[1])
