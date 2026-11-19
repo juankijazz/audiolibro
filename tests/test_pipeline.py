@@ -254,6 +254,19 @@ class Pipeline(unittest.TestCase):
             else:
                 os.environ["AUDIOLIBRO_CRISPASR_URL"] = old
 
+    def test_referencia_masculina_desde_kokoro(self):
+        old = A.DIR_MODELOS
+        with tempfile.TemporaryDirectory() as d:
+            A.DIR_MODELOS = Path(d)
+            try:
+                r = A.referencia_desde_kokoro("em_alex", lambda *_: None, falso=True)
+                self.assertTrue(Path(r).is_file())
+                self.assertEqual(A.motor_de("cb:m1"), "chatterbox")
+                self.assertIn("cb:m1", A.CB_VOCES)
+                self.assertGreater(len(A.CB_TEXTO_REF), 100)
+            finally:
+                A.DIR_MODELOS = old
+
     def test_licencia_voxtral(self):
         old = {k: os.environ.get(k) for k in ("AUDIOLIBRO_DATOS", "CRISPASR_ACCEPT_LICENSE", "AUDIOLIBRO_SIN_CRISPASR")}
         with tempfile.TemporaryDirectory() as d:

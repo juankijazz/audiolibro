@@ -81,9 +81,15 @@ CRISPASR_ZIP = "https://github.com/CrispStrobe/CrispASR/releases/latest/download
 VX_MAX_CHARS = 400       # trozos algo mas largos: menos llamadas y mejor entonacion
 REF_URL = "https://storage.googleapis.com/chatterbox-demo-samples/mtl-v3-single-language-prompts/es-es/"
 CB_VOCES = {
+    "cb:m1": {"etiqueta": "España (castellano) - hombre, voz clara", "kokoro": "em_alex"},
+    "cb:m2": {"etiqueta": "España (castellano) - hombre, voz grave", "kokoro": "em_santa"},
     "cb:f1": {"etiqueta": "España (castellano) - mujer", "archivo": "es_es_f1.wav"},
     "cb:propia": {"etiqueta": "Mi propia voz de referencia (elige un audio)", "archivo": None},
 }
+# Las voces masculinas no tienen audio de referencia publico: se genera uno con Kokoro (castellano) y
+# Chatterbox imita su timbre y su acento.
+CB_TEXTO_REF = ("Había una vez, en un pueblo junto al mar, un hombre que contaba historias cada noche. "
+                "Hablaba despacio, con una voz serena y cálida, y todos le escuchaban hasta el final.")
 CB_EXAG, CB_CFG, CB_TEMP = 0.45, 0.5, 0.75   # narracion serena y estable
 CB_LOTE = 8              # trozos que Chatterbox sintetiza a la vez en la GPU (AUDIOLIBRO_LOTE lo cambia)
 FORMATOS = {
@@ -582,6 +588,19 @@ def descargar(url, dest):
     tmp.replace(dest)
 
 
+def referencia_desde_kokoro(voz_kokoro, log=print, falso=False):
+    """Genera (una vez) un audio de referencia de ~12 s con una voz de Kokoro y devuelve su ruta."""
+    import soundfile as sf
+    dest = DIR_MODELOS / "voces" / f"ref_kokoro_{voz_kokoro}.wav"
+    if not dest.exists():
+        log(f"Creando la voz de referencia ({voz_kokoro})...")
+        k = SintKokoro(voz_kokoro, 0.9, False, log, falso)
+        a = k(CB_TEXTO_REF)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        sf.write(str(dest), a, SAMPLE_RATE)
+    return str(dest)
+
+
 def referencia_cb(voz, voz_ref, log=print):
     """Ruta del audio de referencia que define la voz (y el acento) de Chatterbox."""
     if voz == "cb:propia":
@@ -590,6 +609,8 @@ def referencia_cb(voz, voz_ref, log=print):
                              "con la voz que quieres imitar).")
         return str(voz_ref)
     info = CB_VOCES.get(voz)
+    if info and info.get("kokoro"):
+        return referencia_desde_kokoro(info["kokoro"], log)
     if not info or not info["archivo"]:
         raise ValueError(f"Voz desconocida: {voz}")
     dest = DIR_MODELOS / "voces" / info["archivo"]

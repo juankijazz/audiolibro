@@ -59,6 +59,10 @@ jobs:
         timeout-minutes: 40
         run: |
           python audiolibro.py --muestra muestras_voz/chatterbox_es_f1.wav --voz cb:f1 --cpu
+      - name: Muestra de Chatterbox con voz masculina (referencia generada con Kokoro)
+        timeout-minutes: 40
+        run: |
+          python audiolibro.py --muestra muestras_voz/chatterbox_es_m1.wav --voz cb:m1 --cpu
       - name: Modo por lotes REAL con Chatterbox (CPU, 3 trozos a la vez)
         timeout-minutes: 40
         run: |
