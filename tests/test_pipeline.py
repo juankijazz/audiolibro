@@ -194,6 +194,7 @@ class Pipeline(unittest.TestCase):
                 self.assertEqual(pedidos[0][0], "Bearer sk-unsloth-prueba")
                 self.assertEqual(pedidos[0][1]["voice"], "es_female")
                 self.assertEqual(pedidos[0][1]["language"], "Spanish")
+                self.assertEqual(pedidos[0][1]["audio_options"], {"voice": "es_female"})
                 # una voz que no existe en el servidor se sustituye por la española disponible
                 s2 = A.Sintetizador("vx:es_male", 1.0, True, lambda *_: None)
                 self.assertEqual(s2.nombre_voz, "es_female")
@@ -217,6 +218,10 @@ class Pipeline(unittest.TestCase):
         self.assertEqual((c["voice"], c["voice_id"], c["lang"], c["num_inference_steps"]),
                          ("es_male", "es_male", "Spanish", 7))
         self.assertNotIn("voice_sample", c)
+        self.assertNotIn("audio_options", c)          # el esquema no lo declara: no se envia
+        c = A.cuerpo_voxtral({"audio_options": {"type": "object"}}, "m", "hola", "es_male")
+        self.assertEqual(c["audio_options"], {"voice": "es_male"})
+        self.assertNotIn("audio_options", A.cuerpo_voxtral({}, "m", "hola", "es_male", True, False))
         self.assertNotIn("language", A.cuerpo_voxtral(props, "m", "hola", "es_male", False))
 
     def test_motor_por_lotes_conserva_el_orden(self):

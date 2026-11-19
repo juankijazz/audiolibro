@@ -896,7 +896,7 @@ def campos_speech(url, clave):
         return {}
 
 
-def cuerpo_voxtral(props, modelo, texto, voz, con_idioma=True):
+def cuerpo_voxtral(props, modelo, texto, voz, con_idioma=True, con_opciones=True):
     """Cuerpo de la peticion: se adapta a los nombres de campo reales del servidor."""
     cuerpo = {"model": modelo, "input": texto, "voice": voz, "response_format": "wav"}
     for k, v in (props or {}).items():
@@ -914,6 +914,11 @@ def cuerpo_voxtral(props, modelo, texto, voz, con_idioma=True):
             cuerpo[k] = 7                        # los mismos pasos que usa el panel de Unsloth
     if con_idioma and not any(k.lower() in ("language", "lang", "language_id", "lang_code") for k in cuerpo):
         cuerpo["language"] = "Spanish"
+    # Unsloth solo aplica 'voice' como altavoz si el modelo lo lista (Voxtral no lo hace: sus voces van
+    # incrustadas) y, si no, lo ignora y suena la voz por defecto (inglesa). El panel de Unsloth manda la
+    # voz dentro de audio_options, asi que se envia tambien alli.
+    if con_opciones and (not props or "audio_options" in props):
+        cuerpo["audio_options"] = {"voice": voz}
     return cuerpo
 
 
@@ -1041,16 +1046,21 @@ class SintVoxtral:
 
     def _sintetizar(self, texto, semilla):
         if self.modo == "api":
-            cuerpo = cuerpo_voxtral(getattr(self, "props", {}), self.modelo, texto, self.nombre_voz,
-                                    getattr(self, "con_idioma", True))
-            try:
-                datos, tipo = _http(self.url + "/v1/audio/speech", self.clave, cuerpo, timeout=900)
-            except RuntimeError as e:
-                if getattr(self, "con_idioma", True) and ("422" in str(e) or "400" in str(e)):
-                    self.con_idioma = False                   # este servidor no admite el campo: se reintenta sin él
-                    cuerpo = cuerpo_voxtral(getattr(self, "props", {}), self.modelo, texto, self.nombre_voz, False)
+            # variantes de la peticion, de la mas completa a la mas simple; se recuerda la que el servidor acepta
+            variantes = [(True, True), (True, False), (False, True), (False, False)]
+            ini = getattr(self, "variante", 0)
+            datos = tipo = None
+            for i in range(ini, len(variantes)):
+                idioma, opciones = variantes[i]
+                cuerpo = cuerpo_voxtral(getattr(self, "props", {}), self.modelo, texto, self.nombre_voz,
+                                        idioma, opciones)
+                try:
                     datos, tipo = _http(self.url + "/v1/audio/speech", self.clave, cuerpo, timeout=900)
-                else:
+                    self.variante = i
+                    break
+                except RuntimeError as e:
+                    if i < len(variantes) - 1 and ("422" in str(e) or "400" in str(e)):
+                        continue
                     raise
             if "json" in tipo.lower():
                 raise RuntimeError(f"Respuesta inesperada de Unsloth: {datos[:300].decode('utf-8', 'replace')}")
