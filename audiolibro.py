@@ -856,6 +856,15 @@ def asegurar_crispasr(log=print):
     return exe
 
 
+VX_LICENCIA = "cc-by-nc-4.0"
+
+
+def licencia_voxtral_aceptada():
+    """True si el usuario ya acepto la licencia CC BY-NC 4.0 de Voxtral (ajustes o variable de entorno)."""
+    return bool(cargar_ajustes().get("vx_licencia") == VX_LICENCIA
+                or os.environ.get("CRISPASR_ACCEPT_LICENSE", "").lower() == VX_LICENCIA)
+
+
 def arrancar_crispasr(usar_gpu, log=print):
     """Arranca (una sola vez) el servidor de Voxtral de CrispASR y devuelve su URL."""
     import atexit
@@ -866,6 +875,10 @@ def arrancar_crispasr(usar_gpu, log=print):
     p = _CRISP["proc"]
     if p is not None and p.poll() is None and _CRISP["url"]:
         return _CRISP["url"]
+    if not licencia_voxtral_aceptada():
+        raise RuntimeError(
+            "Voxtral se publica con licencia CC BY-NC 4.0 (solo uso no comercial). Acepta la licencia en el "
+            "aviso de la aplicación, o ejecuta con --vx-licencia / CRISPASR_ACCEPT_LICENSE=cc-by-nc-4.0.")
     exe = asegurar_crispasr(log)
     with socket.socket() as sk:
         sk.bind(("127.0.0.1", 0))
@@ -873,7 +886,7 @@ def arrancar_crispasr(usar_gpu, log=print):
     url = f"http://127.0.0.1:{puerto}"
     datos = _dir_datos()
     datos.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ, CRISPASR_CACHE_DIR=str(datos / "modelos"))
+    env = dict(os.environ, CRISPASR_CACHE_DIR=str(datos / "modelos"), CRISPASR_ACCEPT_LICENSE=VX_LICENCIA)
     cmd = [exe, "--server", "--backend", "voxtral-tts", "-m", "auto", "--auto-download",
            "--host", "127.0.0.1", "--port", str(puerto)]
     if not usar_gpu:
@@ -2055,8 +2068,24 @@ def gui():
                 c.seleccionado = v
             self.poblar()
 
+        def _licencia_ok(self):
+            """Pide (una sola vez) que el usuario acepte la licencia no comercial de Voxtral."""
+            if self.motor() != "voxtral" or licencia_voxtral_aceptada():
+                return True
+            ok = messagebox.askyesno(
+                "Licencia de Voxtral",
+                "Voxtral (Mistral AI) se publica con la licencia CC BY-NC 4.0: solo se puede usar para "
+                "fines NO comerciales (uso personal).\n\nTexto completo: "
+                "https://huggingface.co/mistralai/Voxtral-4B-TTS-2603\n\n"
+                "¿Aceptas esos términos y quieres usar Voxtral?")
+            if ok:
+                guardar_ajustes(vx_licencia=VX_LICENCIA)
+            return ok
+
         def muestra(self):
             if self.ocupado:
+                return
+            if not self._licencia_ok():
                 return
             texto = "Hola. Esta es una muestra de la voz que has elegido para tu audiolibro."
             if self.libro:
@@ -2083,6 +2112,8 @@ def gui():
             threading.Thread(target=trabajo, daemon=True).start()
 
         def convertir(self):
+            if not self._licencia_ok():
+                return
             if not self.libro:
                 messagebox.showinfo("Audiolibro", "Primero elige un libro y pulsa Analizar.")
                 return
@@ -2224,6 +2255,8 @@ def main(argv=None):
     ap.add_argument("--voz", default="ef_dora",
                     help="ef_dora, em_alex, em_santa (Kokoro) | cb:f1, cb:propia (Chatterbox alta calidad) | vx:es_female, vx:es_male (Voxtral)")
     ap.add_argument("--vx-gguf", default="", help="ruta del GGUF de Voxtral TTS (si no se detecta solo)")
+    ap.add_argument("--vx-licencia", action="store_true",
+                    help="acepto la licencia CC BY-NC 4.0 (solo uso no comercial) de Voxtral")
     ap.add_argument("--vx-exe", default="", help="ruta de crispasr.exe (alternativa a Unsloth)")
     ap.add_argument("--vx-url", default="", help="URL del servidor de Unsloth Studio, p. ej. http://127.0.0.1:8888")
     ap.add_argument("--vx-clave", default="", help="clave API de Unsloth (Ajustes > API)")
@@ -2255,6 +2288,8 @@ def main(argv=None):
         return precargar()
     if a.precargar_hq:
         return precargar_hq()
+    if a.vx_licencia:
+        guardar_ajustes(vx_licencia=VX_LICENCIA)
     if a.vx_gguf or a.vx_exe or a.vx_url or a.vx_clave or a.vx_modelo:
         guardar_ajustes(vx_gguf=a.vx_gguf or None, vx_exe=a.vx_exe or None, vx_url=a.vx_url or None,
                         vx_clave=a.vx_clave or None, vx_modelo=a.vx_modelo or None)

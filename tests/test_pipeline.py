@@ -254,6 +254,26 @@ class Pipeline(unittest.TestCase):
             else:
                 os.environ["AUDIOLIBRO_CRISPASR_URL"] = old
 
+    def test_licencia_voxtral(self):
+        old = {k: os.environ.get(k) for k in ("AUDIOLIBRO_DATOS", "CRISPASR_ACCEPT_LICENSE", "AUDIOLIBRO_SIN_CRISPASR")}
+        with tempfile.TemporaryDirectory() as d:
+            os.environ.update(AUDIOLIBRO_DATOS=d)
+            os.environ.pop("CRISPASR_ACCEPT_LICENSE", None)
+            os.environ.pop("AUDIOLIBRO_SIN_CRISPASR", None)
+            try:
+                self.assertFalse(A.licencia_voxtral_aceptada())
+                with self.assertRaises(RuntimeError) as cm:
+                    A.arrancar_crispasr(False)
+                self.assertIn("CC BY-NC", str(cm.exception))
+                A.guardar_ajustes(vx_licencia=A.VX_LICENCIA)
+                self.assertTrue(A.licencia_voxtral_aceptada())
+            finally:
+                for k, v in old.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+
     def test_cuerpo_voxtral_segun_esquema(self):
         c = A.cuerpo_voxtral({}, "m", "hola", "es_male")
         self.assertEqual((c["voice"], c["language"]), ("es_male", "Spanish"))
