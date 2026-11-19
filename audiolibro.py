@@ -1505,8 +1505,8 @@ def precargar():
 def gui():
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
+    import ctypes
     try:
-        import ctypes
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
         pass
@@ -1520,11 +1520,169 @@ def gui():
     FUENTE = "Segoe UI"
     MARCA_SI, MARCA_NO = "✔", "○"
 
+    from tkinter import font as tkfont
+
+    def _rr(cv, x1, y1, x2, y2, r, **kw):
+        """Rectangulo con esquinas redondeadas en un Canvas."""
+        r = max(0, min(r, (x2 - x1) / 2, (y2 - y1) / 2))
+        pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2, x2 - r, y2,
+               x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+        return cv.create_polygon(pts, smooth=True, **kw)
+
+    class RBoton(tk.Canvas):
+        """Boton redondeado con efecto al pasar el raton (estilos: 'suave' y 'accion')."""
+        PAL = {"suave": ("gris", "#E2D8C8", "#D3C8B4", "indigo", "#F3EEE6", "#B3AAA0"),
+               "accion": ("boton", "boton_h", "boton_p", "#FFFFFF", "#EBC8B4", "#FFFFFF")}
+
+        def __init__(self, padre, texto, comando=None, estilo="suave", state="normal"):
+            try:
+                bg = padre.cget("bg")
+            except Exception:
+                bg = C["tarjeta"]
+            self.estilo, self.texto, self.comando = estilo, texto, comando
+            self._estado, self._sobre, self._pulsado = state, False, False
+            self.fuente = tkfont.Font(family=FUENTE, size=12 if estilo == "accion" else 10,
+                                      weight="bold" if estilo == "accion" else "normal")
+            super().__init__(padre, bg=bg, highlightthickness=0, bd=0, takefocus=0)
+            self._medir()
+            self.bind("<Enter>", lambda e: self._poner(sobre=True))
+            self.bind("<Leave>", lambda e: self._poner(sobre=False, pulsado=False))
+            self.bind("<ButtonPress-1>", lambda e: self._poner(pulsado=True))
+            self.bind("<ButtonRelease-1>", self._soltar)
+            self._dibujar()
+
+        def _medir(self):
+            px, py = (30, 13) if self.estilo == "accion" else (15, 7)
+            self.an = self.fuente.measure(self.texto) + 2 * px
+            self.al = self.fuente.metrics("linespace") + 2 * py
+            tk.Canvas.configure(self, width=self.an, height=self.al)
+
+        def _col(self, i):
+            v = self.PAL[self.estilo][i]
+            return C.get(v, v)
+
+        def _dibujar(self):
+            self.delete("all")
+            w, h = self.an, self.al
+            if self._estado == "disabled":
+                fondo, fg = self._col(4), self._col(5)
+            else:
+                fondo = self._col(2 if self._pulsado else 1 if self._sobre else 0)
+                fg = self._col(3)
+            _rr(self, 1, 1, w - 1, h - 1, h / 2 if self.estilo == "accion" else 14, fill=fondo, outline=fondo)
+            self.create_text(w / 2, h / 2, text=self.texto, fill=fg, font=self.fuente)
+            tk.Canvas.configure(self, cursor="arrow" if self._estado == "disabled" else "hand2")
+
+        def _poner(self, sobre=None, pulsado=None):
+            if sobre is not None:
+                self._sobre = sobre
+            if pulsado is not None:
+                self._pulsado = pulsado
+            self._dibujar()
+
+        def _soltar(self, e):
+            dentro = 0 <= e.x <= self.an and 0 <= e.y <= self.al
+            fue = self._pulsado
+            self._poner(pulsado=False)
+            if fue and dentro and self._estado != "disabled" and self.comando:
+                self.comando()
+
+        def configure(self, cnf=None, **kw):
+            if cnf:
+                kw.update(cnf)
+            if "state" in kw:
+                self._estado = kw.pop("state")
+            if "text" in kw:
+                self.texto = kw.pop("text")
+                self._medir()
+            if "command" in kw:
+                self.comando = kw.pop("command")
+            if kw:
+                tk.Canvas.configure(self, **kw)
+            self._dibujar()
+        config = configure
+
+    class RTarjeta(tk.Canvas):
+        """Tarjeta blanca con esquinas redondeadas, sombra suave y titulo."""
+        def __init__(self, padre, titulo):
+            super().__init__(padre, bg=padre.cget("bg"), highlightthickness=0, bd=0)
+            self.interior = tk.Frame(self, bg=C["tarjeta"])
+            self.etiqueta = tk.Label(self, text=titulo, bg=C["tarjeta"], fg=C["indigo"],
+                                     font=(FUENTE, 11, "bold"))
+            self.v_titulo = self.create_window(20, 10, window=self.etiqueta, anchor="nw")
+            self.v_cuerpo = self.create_window(20, 38, window=self.interior, anchor="nw")
+            self.bind("<Configure>", self._ajustar)
+            self.interior.bind("<Configure>", self._pedir)
+
+        def _pedir(self, e=None):
+            h = 38 + self.interior.winfo_reqheight() + 14
+            if self.winfo_reqheight() != h:
+                self.configure(height=h)
+
+        def _ajustar(self, e=None):
+            w, h = self.winfo_width(), self.winfo_height()
+            if w < 60 or h < 60:
+                return
+            self.delete("fig")
+            _rr(self, 3, 5, w - 3, h - 1, 18, fill="#E3D9C5", outline="", tags="fig")
+            _rr(self, 2, 2, w - 4, h - 4, 18, fill=C["tarjeta"], outline=C["borde"], tags="fig")
+            self.tag_lower("fig")
+            self.itemconfigure(self.v_cuerpo, width=w - 44, height=max(10, h - 38 - 16))
+
+    class RProgreso(tk.Canvas):
+        """Barra de progreso redondeada; admite barra["value"] = x como ttk.Progressbar."""
+        def __init__(self, padre, maximo=1000):
+            super().__init__(padre, bg=padre.cget("bg"), height=14, highlightthickness=0, bd=0)
+            self.maximo, self.valor = maximo, 0
+            self.bind("<Configure>", lambda e: self._dibujar())
+
+        def __setitem__(self, k, v):
+            if k == "value":
+                self.valor = v
+                self._dibujar()
+            else:
+                tk.Canvas.__setitem__(self, k, v)
+
+        def _dibujar(self):
+            self.delete("all")
+            w, h = self.winfo_width(), self.winfo_height()
+            if w < 20:
+                return
+            _rr(self, 0, 0, w, h, h / 2, fill=C["gris"], outline=C["gris"])
+            frac = max(0.0, min(1.0, self.valor / float(self.maximo or 1)))
+            if frac > 0:
+                _rr(self, 0, 0, max(h, w * frac), h, h / 2, fill=C["acento"], outline=C["acento"])
+
+    class Cabecera(tk.Canvas):
+        """Cabecera con degradado de indigo a turquesa."""
+        def __init__(self, padre):
+            super().__init__(padre, height=78, highlightthickness=0, bd=0, bg=C["indigo"])
+            self.bind("<Configure>", self._pintar)
+
+        @staticmethod
+        def _mezcla(a, b, t):
+            ca = [int(a[i:i + 2], 16) for i in (1, 3, 5)]
+            cb = [int(b[i:i + 2], 16) for i in (1, 3, 5)]
+            return "#%02x%02x%02x" % tuple(int(x + (y - x) * t) for x, y in zip(ca, cb))
+
+        def _pintar(self, e=None):
+            w, h = self.winfo_width(), self.winfo_height()
+            self.delete("all")
+            paso = 4
+            for x in range(0, w + paso, paso):
+                self.create_rectangle(x, 0, x + paso, h, width=0,
+                                      fill=self._mezcla("#0B3C6F", "#1B9AA6", x / max(1, w)))
+            self.create_rectangle(0, h - 4, w, h, width=0, fill=C["sol"])
+            self.create_text(26, h / 2 - 2, text="\U0001F3A7  Audiolibro", anchor="w", fill="white",
+                             font=(FUENTE, 22, "bold"))
+            self.create_text(250, h / 2 + 4, anchor="w", fill="#D8EEF4", font=(FUENTE, 11),
+                             text="Convierte tus libros en audio con voces naturales, en tu propio PC")
+
     class App:
         def __init__(self, root):
             self.root = root
             root.title("Audiolibro - EPUB / PDF / TXT a audio")
-            root.geometry("1120x700")
+            root.geometry("1120x720")
             root.minsize(980, 560)
             root.configure(bg=C["fondo"])
             self.q = queue.Queue()
@@ -1550,13 +1708,7 @@ def gui():
             self._estilos()
 
             # --- cabecera
-            cab = tk.Frame(root, bg=C["indigo"])
-            cab.pack(fill="x")
-            tk.Label(cab, text="\U0001F3A7  Audiolibro", bg=C["indigo"], fg="white",
-                     font=(FUENTE, 22, "bold")).pack(side="left", padx=(24, 12), pady=(14, 14))
-            tk.Label(cab, text="Convierte tus libros en audio con voces naturales, en tu propio PC",
-                     bg=C["indigo"], fg=C["claro"], font=(FUENTE, 11)).pack(side="left", pady=(20, 0))
-            tk.Frame(root, bg=C["sol"], height=4).pack(fill="x")
+            Cabecera(root).pack(fill="x")
 
             cuerpo = tk.Frame(root, bg=C["fondo"])
             cuerpo.pack(fill="both", expand=True, padx=20, pady=(12, 10))
@@ -1574,10 +1726,8 @@ def gui():
             t1.pack(fill="x")
             t1.columnconfigure(0, weight=1)
             ttk.Entry(t1, textvariable=self.v_archivo).grid(row=0, column=0, sticky="ew", padx=(0, 8))
-            ttk.Button(t1, text="Examinar...", style="Suave.TButton",
-                       command=self.elegir).grid(row=0, column=1)
-            ttk.Button(t1, text="Analizar", style="Suave.TButton",
-                       command=self.analizar).grid(row=0, column=2, padx=(6, 0))
+            RBoton(t1, "Examinar...", self.elegir).grid(row=0, column=1)
+            RBoton(t1, "Analizar", self.analizar).grid(row=0, column=2, padx=(6, 0))
 
             # --- capitulos
             t2 = self._tarjeta(izq, "Capítulos  (clic para marcar / desmarcar)")
@@ -1585,13 +1735,13 @@ def gui():
             t2.columnconfigure(0, weight=1)
             t2.rowconfigure(0, weight=1)
             cols = ("sel", "titulo", "chars")
-            self.tree = ttk.Treeview(t2, columns=cols, show="headings", height=6, selectmode="none",
+            self.tree = ttk.Treeview(t2, columns=cols, show="headings", height=5, selectmode="none",
                                      style="Cap.Treeview")
             self.tree.heading("sel", text="Leer")
             self.tree.heading("titulo", text="Capítulo")
             self.tree.heading("chars", text="Caracteres")
             self.tree.column("sel", width=56, anchor="center", stretch=False)
-            self.tree.column("titulo", width=360)
+            self.tree.column("titulo", width=240)
             self.tree.column("chars", width=90, anchor="e", stretch=False)
             self.tree.tag_configure("par", background=C["tarjeta"])
             self.tree.tag_configure("impar", background=C["fila"])
@@ -1602,10 +1752,8 @@ def gui():
             sb.grid(row=0, column=1, sticky="ns")
             bt = tk.Frame(t2, bg=C["tarjeta"])
             bt.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
-            ttk.Button(bt, text="Marcar todo", style="Suave.TButton",
-                       command=lambda: self.marcar(True)).pack(side="left")
-            ttk.Button(bt, text="Desmarcar todo", style="Suave.TButton",
-                       command=lambda: self.marcar(False)).pack(side="left", padx=6)
+            RBoton(bt, "Marcar todo", lambda: self.marcar(True)).pack(side="left")
+            RBoton(bt, "Desmarcar todo", lambda: self.marcar(False)).pack(side="left", padx=6)
 
             # --- 2. Voz
             t3 = self._tarjeta(der, "2  ·  Voz")
@@ -1620,12 +1768,11 @@ def gui():
             self.cb_voz = ttk.Combobox(t3, textvariable=self.v_voz, state="readonly")
             self.cb_voz.grid(row=1, column=1, sticky="ew", padx=(10, 6), pady=3)
             self.cb_voz.bind("<<ComboboxSelected>>", lambda e: self.cambia_voz())
-            ttk.Button(t3, text="▶  Escuchar", style="Suave.TButton",
-                       command=self.muestra).grid(row=1, column=2)
+            RBoton(t3, "▶  Escuchar", self.muestra).grid(row=1, column=2)
             ttk.Label(t3, text="Referencia", style="Card.TLabel").grid(row=2, column=0, sticky="w")
             self.en_ref = ttk.Entry(t3, textvariable=self.v_ref, state="readonly")
             self.en_ref.grid(row=2, column=1, sticky="ew", padx=(10, 6), pady=3)
-            self.bt_ref = ttk.Button(t3, text="Elegir...", style="Suave.TButton", command=self.elegir_ref)
+            self.bt_ref = RBoton(t3, "Elegir...", self.elegir_ref)
             self.bt_ref.grid(row=2, column=2)
             aj = cargar_ajustes()
             self.v_vx_url = tk.StringVar(value=aj.get("vx_url") or "http://127.0.0.1:8888")
@@ -1633,7 +1780,7 @@ def gui():
             self.fila_vx = []
             e1 = ttk.Label(t3, text="Servidor Unsloth", style="Card.TLabel")
             e2 = ttk.Entry(t3, textvariable=self.v_vx_url)
-            e3 = ttk.Button(t3, text="Cargar voces", style="Suave.TButton", command=self.cargar_voces_vx)
+            e3 = RBoton(t3, "Cargar voces", self.cargar_voces_vx)
             e1.grid(row=3, column=0, sticky="w")
             e2.grid(row=3, column=1, sticky="ew", padx=(10, 6), pady=3)
             e3.grid(row=3, column=2)
@@ -1665,8 +1812,7 @@ def gui():
                                                               padx=(10, 0), pady=3)
             ttk.Label(t4, text="Guardar en", style="Card.TLabel").grid(row=2, column=0, sticky="w")
             ttk.Entry(t4, textvariable=self.v_salida).grid(row=2, column=1, sticky="ew", padx=(10, 6), pady=3)
-            ttk.Button(t4, text="Cambiar...", style="Suave.TButton",
-                       command=self.elegir_salida).grid(row=2, column=2)
+            RBoton(t4, "Cambiar...", self.elegir_salida).grid(row=2, column=2)
             self.chk_gpu = ttk.Checkbutton(t4, text="Usar la GPU (CUDA)", variable=self.v_gpu,
                                            style="Card.TCheckbutton")
             self.chk_gpu.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
@@ -1685,14 +1831,12 @@ def gui():
             pie.columnconfigure(0, weight=1)
             ac = tk.Frame(pie, bg=C["fondo"])
             ac.grid(row=0, column=0, sticky="ew")
-            self.btn_go = ttk.Button(ac, text="▶   CONVERTIR A AUDIOLIBRO", style="Accion.TButton",
-                                     command=self.convertir)
+            self.btn_go = RBoton(ac, "▶   CONVERTIR A AUDIOLIBRO", self.convertir, estilo="accion")
             self.btn_go.pack(side="left")
-            self.btn_stop = ttk.Button(ac, text="Cancelar", style="Suave.TButton", command=self.cancelar,
-                                       state="disabled")
+            self.btn_stop = RBoton(ac, "Cancelar", self.cancelar, state="disabled")
             self.btn_stop.pack(side="left", padx=12)
             ttk.Label(ac, textvariable=self.v_estado, style="Estado.TLabel").pack(side="left", padx=8)
-            self.pb = ttk.Progressbar(pie, maximum=1000, style="Acento.Horizontal.TProgressbar")
+            self.pb = RProgreso(pie, 1000)
             self.pb.grid(row=1, column=0, sticky="ew", pady=(10, 8))
             self.log = tk.Text(pie, height=5, state="disabled", wrap="word", font=("Consolas", 9),
                                bg=C["tarjeta"], fg=C["texto"], relief="flat", bd=0, padx=10, pady=8,
@@ -1703,6 +1847,12 @@ def gui():
             self.log.configure(yscrollcommand=sb_log.set)
             sb_log.grid(row=2, column=1, sticky="ns")
 
+            try:
+                root.update_idletasks()
+                hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(ctypes.c_int(2)), 4)
+            except Exception:
+                pass
             threading.Thread(target=self._detectar_gpu, daemon=True).start()
             root.after(100, self._poll)
 
@@ -1760,14 +1910,10 @@ def gui():
                         bordercolor=C["tarjeta"], arrowcolor=C["indigo"])
 
         def _tarjeta(self, padre, titulo):
-            """Tarjeta blanca con borde suave y titulo en indigo; devuelve el marco interior."""
-            ext = tk.Frame(padre, bg=C["tarjeta"], highlightthickness=1, highlightbackground=C["borde"])
-            tk.Label(ext, text=titulo, bg=C["tarjeta"], fg=C["indigo"],
-                     font=(FUENTE, 11, "bold")).pack(anchor="w", padx=16, pady=(12, 6))
-            interior = tk.Frame(ext, bg=C["tarjeta"])
-            interior.pack(fill="both", expand=True, padx=16, pady=(0, 14))
-            # el empaquetado del marco exterior lo hace quien llama: reenviamos pack/grid
-            interior.pack = ext.pack
+            """Tarjeta redondeada con titulo; devuelve el marco interior (empaquetar con pack)."""
+            tj = RTarjeta(padre, titulo)
+            interior = tj.interior
+            interior.pack = tj.pack          # el empaquetado lo hace quien llama
             return interior
 
         # --- utilidades
