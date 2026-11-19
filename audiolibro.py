@@ -918,7 +918,7 @@ def cuerpo_voxtral(props, modelo, texto, voz, con_idioma=True, con_opciones=True
     # incrustadas) y, si no, lo ignora y suena la voz por defecto (inglesa). El panel de Unsloth manda la
     # voz dentro de audio_options, asi que se envia tambien alli.
     if con_opciones and (not props or "audio_options" in props):
-        cuerpo["audio_options"] = {"voice": voz}
+        cuerpo["audio_options"] = {"voice_id": voz}   # nombre real de la opcion en audio.cpp (Voxtral)
     return cuerpo
 
 

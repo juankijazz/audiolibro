@@ -194,7 +194,7 @@ class Pipeline(unittest.TestCase):
                 self.assertEqual(pedidos[0][0], "Bearer sk-unsloth-prueba")
                 self.assertEqual(pedidos[0][1]["voice"], "es_female")
                 self.assertEqual(pedidos[0][1]["language"], "Spanish")
-                self.assertEqual(pedidos[0][1]["audio_options"], {"voice": "es_female"})
+                self.assertEqual(pedidos[0][1]["audio_options"], {"voice_id": "es_female"})
                 # una voz que no existe en el servidor se sustituye por la española disponible
                 s2 = A.Sintetizador("vx:es_male", 1.0, True, lambda *_: None)
                 self.assertEqual(s2.nombre_voz, "es_female")
@@ -220,7 +220,7 @@ class Pipeline(unittest.TestCase):
         self.assertNotIn("voice_sample", c)
         self.assertNotIn("audio_options", c)          # el esquema no lo declara: no se envia
         c = A.cuerpo_voxtral({"audio_options": {"type": "object"}}, "m", "hola", "es_male")
-        self.assertEqual(c["audio_options"], {"voice": "es_male"})
+        self.assertEqual(c["audio_options"], {"voice_id": "es_male"})
         self.assertNotIn("audio_options", A.cuerpo_voxtral({}, "m", "hola", "es_male", True, False))
         self.assertNotIn("language", A.cuerpo_voxtral(props, "m", "hola", "es_male", False))
 
