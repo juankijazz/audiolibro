@@ -68,6 +68,9 @@ VX_VOCES = {
     "vx:es_male": "Español - hombre (es_male)",
     "vx:neutral_female": "Neutra - mujer (neutral_female)",
     "vx:neutral_male": "Neutra - hombre (neutral_male)",
+    "vx:casual_female": "Informal - mujer (casual_female)",
+    "vx:casual_male": "Informal - hombre (casual_male)",
+    "vx:cheerful_female": "Alegre - mujer (cheerful_female)",
 }
 VX_MAX_CHARS = 400       # trozos algo mas largos: menos llamadas y mejor entonacion
 REF_URL = "https://storage.googleapis.com/chatterbox-demo-samples/mtl-v3-single-language-prompts/es-es/"
@@ -1629,7 +1632,10 @@ def gui():
             self.log.config(state="disabled")
 
         def voz(self):
-            return self.v_voz.get().split("|")[0].strip()
+            v = self.v_voz.get().split("|")[0].strip()
+            if self.motor() == "voxtral" and v and not v.startswith("vx:"):
+                v = "vx:" + v          # permite escribir a mano cualquier voz (p. ej. casual_female)
+            return v
 
         def motor(self):
             return next(k for k, v in MOTORES.items() if v == self.v_motor.get())
@@ -1647,13 +1653,14 @@ def gui():
                 vals = [f"{k}  |  {v}" for k, v in VX_VOCES.items()]
                 self.v_info.set("Voxtral (Mistral, 4B): voz muy natural, solo para uso personal (licencia no "
                                 "comercial). Se ejecuta en Unsloth Studio: ábrelo, carga Voxtral TTS y pega aquí "
-                                "la clave de Ajustes > API.")
+                                "la clave de Ajustes > API. Las voces son las incluidas en el modelo (no hace "
+                                "falta cargarlas); puedes escribir el nombre de otra en el desplegable.")
             else:
                 vals = [f"{k}  |  {v['etiqueta']}" for k, v in CB_VOCES.items()]
                 self.v_info.set("Alta calidad: Chatterbox con el paquete de España. Imita la voz y el acento del "
                                 "audio de referencia (puedes poner el tuyo). Más lento y necesita GPU; la primera "
                                 "vez descarga unos 4,3 GB.")
-            self.cb_voz.config(values=vals)
+            self.cb_voz.config(values=vals, state="normal" if vx else "readonly")
             self.v_voz.set(vals[0])
             self.cambia_voz()
             if vx and self.v_vx_clave.get().strip():
