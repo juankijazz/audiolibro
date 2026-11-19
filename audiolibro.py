@@ -66,12 +66,18 @@ MOTORES = {
 VX_VOCES = {
     "vx:es_female": "Español - mujer (es_female)",
     "vx:es_male": "Español - hombre (es_male)",
-    "vx:neutral_female": "Neutra - mujer (neutral_female)",
-    "vx:neutral_male": "Neutra - hombre (neutral_male)",
-    "vx:casual_female": "Informal - mujer (casual_female)",
-    "vx:casual_male": "Informal - hombre (casual_male)",
-    "vx:cheerful_female": "Alegre - mujer (cheerful_female)",
+    "vx:neutral_female": "Inglés neutro - mujer",
+    "vx:neutral_male": "Inglés neutro - hombre",
+    "vx:casual_female": "Inglés informal - mujer",
+    "vx:casual_male": "Inglés informal - hombre",
+    "vx:cheerful_female": "Inglés alegre - mujer",
+    "vx:pt_female": "Portugués - mujer", "vx:pt_male": "Portugués - hombre",
+    "vx:fr_female": "Francés - mujer", "vx:fr_male": "Francés - hombre",
+    "vx:it_female": "Italiano - mujer", "vx:it_male": "Italiano - hombre",
+    "vx:de_female": "Alemán - mujer", "vx:de_male": "Alemán - hombre",
+    "vx:nl_female": "Neerlandés - mujer", "vx:nl_male": "Neerlandés - hombre",
 }
+CRISPASR_ZIP = "https://github.com/CrispStrobe/CrispASR/releases/latest/download/crispasr-windows-x86_64-cuda.zip"
 VX_MAX_CHARS = 400       # trozos algo mas largos: menos llamadas y mejor entonacion
 REF_URL = "https://storage.googleapis.com/chatterbox-demo-samples/mtl-v3-single-language-prompts/es-es/"
 CB_VOCES = {
@@ -799,7 +805,106 @@ def buscar_crispasr():
                  _dir_datos() / "bin" / exe, APP_DIR / exe, shutil.which("crispasr")):
         if cand and Path(cand).is_file():
             return str(cand)
+    try:
+        for cand in (_dir_datos() / "bin").rglob(exe):
+            return str(cand)
+    except OSError:
+        pass
     return ""
+
+
+_CRISP = {"proc": None, "url": ""}
+
+
+def _descargar(url, destino, log, etiqueta):
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "Audiolibro/2"})
+    with urllib.request.urlopen(req, timeout=60) as r, open(destino, "wb") as f:
+        total = int(r.headers.get("Content-Length") or 0)
+        hecho, ultimo = 0, -1
+        while True:
+            b = r.read(1 << 20)
+            if not b:
+                break
+            f.write(b)
+            hecho += len(b)
+            if total and hecho * 10 // total != ultimo:
+                ultimo = hecho * 10 // total
+                log(f"Descargando {etiqueta}: {hecho * 100 // total} %")
+
+
+def asegurar_crispasr(log=print):
+    """Devuelve la ruta de crispasr.exe; si no esta, lo descarga (zip oficial con CUDA, ~100-300 MB)."""
+    exe = buscar_crispasr()
+    if exe:
+        return exe
+    if os.name != "nt":
+        raise RuntimeError("No encuentro 'crispasr'. Instálalo desde github.com/CrispStrobe/CrispASR/releases "
+                           "o indica su ruta en AUDIOLIBRO_CRISPASR.")
+    import zipfile
+    destino = _dir_datos() / "bin"
+    destino.mkdir(parents=True, exist_ok=True)
+    zip_ = destino / "crispasr.zip"
+    log("Descargando el motor de voz de Voxtral (solo la primera vez)...")
+    _descargar(CRISPASR_ZIP, zip_, log, "motor de voz")
+    with zipfile.ZipFile(zip_) as z:
+        z.extractall(destino)
+    zip_.unlink(missing_ok=True)
+    exe = buscar_crispasr()
+    if not exe:
+        raise RuntimeError("El zip descargado no contiene crispasr.exe.")
+    return exe
+
+
+def arrancar_crispasr(usar_gpu, log=print):
+    """Arranca (una sola vez) el servidor de Voxtral de CrispASR y devuelve su URL."""
+    import atexit
+    import socket
+    import urllib.request
+    if os.environ.get("AUDIOLIBRO_SIN_CRISPASR"):
+        raise RuntimeError("CrispASR desactivado (AUDIOLIBRO_SIN_CRISPASR).")
+    p = _CRISP["proc"]
+    if p is not None and p.poll() is None and _CRISP["url"]:
+        return _CRISP["url"]
+    exe = asegurar_crispasr(log)
+    with socket.socket() as sk:
+        sk.bind(("127.0.0.1", 0))
+        puerto = sk.getsockname()[1]
+    url = f"http://127.0.0.1:{puerto}"
+    datos = _dir_datos()
+    datos.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ, CRISPASR_CACHE_DIR=str(datos / "modelos"))
+    cmd = [exe, "--server", "--backend", "voxtral-tts", "-m", "auto", "--auto-download",
+           "--host", "127.0.0.1", "--port", str(puerto)]
+    if not usar_gpu:
+        cmd.append("--no-gpu")
+    reg = datos / "crispasr.log"
+    log("Arrancando Voxtral (la primera vez descarga el modelo, unos 2-4 GB)...")
+    salida = open(reg, "wb")
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=salida, stderr=subprocess.STDOUT, env=env,
+                            creationflags=0x08000000 if os.name == "nt" else 0)
+    atexit.register(lambda: proc.poll() is None and proc.terminate())
+    t0, ult = time.time(), 0
+    while True:
+        if proc.poll() is not None:
+            salida.close()
+            cola = reg.read_bytes()[-800:].decode("utf-8", "replace")
+            raise RuntimeError(f"El motor de Voxtral se cerró (código {proc.returncode}). Registro:\n{cola}")
+        try:
+            with urllib.request.urlopen(url + "/health", timeout=3) as r:
+                if r.status == 200:
+                    break
+        except Exception:
+            pass
+        if time.time() - t0 > 2400:
+            proc.terminate()
+            raise RuntimeError("El motor de Voxtral tardó más de 40 min en arrancar.")
+        if time.time() - ult > 30:
+            ult = time.time()
+            log(f"Preparando Voxtral... ({int(time.time() - t0)} s)")
+        time.sleep(2)
+    _CRISP["proc"], _CRISP["url"] = proc, url
+    return url
 
 
 def _http(url, clave="", cuerpo=None, timeout=30):
@@ -975,39 +1080,38 @@ class SintVoxtral:
             return
         self.nombre_voz = str(voz)[3:]
         self.usar_gpu = usar_gpu
+        self.modo = "crisp"
         aj = cargar_ajustes()
-        self.clave = aj.get("vx_clave") or os.environ.get("UNSLOTH_API_KEY", "")
-        self.url = buscar_servidor_unsloth()
-        if self.url:
-            self.modo = "api"
-            if not self.clave:
-                raise RuntimeError(
-                    "Unsloth pide una clave API. En Unsloth Studio ve a Settings > API, crea una clave "
-                    "(empieza por sk-unsloth-) y pégala en el campo 'Clave API' de Audiolibro.")
+        # 1) un servidor CrispASR ya en marcha (AUDIOLIBRO_CRISPASR_URL o ajustes); 2) arrancarlo aqui
+        #    (se descarga solo); 3) como ultimo recurso, Unsloth Studio si hay clave guardada.
+        url = (os.environ.get("AUDIOLIBRO_CRISPASR_URL") or aj.get("vx_crisp_url") or "").rstrip("/")
+        causa = ""
+        if not url:
             try:
-                self.modelo = _modelo_api(self.url, self.clave)
-                self.props = campos_speech(self.url, self.clave)
-                self._elegir_voz()
-            except RuntimeError as e:
-                if "401" in str(e):
-                    raise RuntimeError("Unsloth rechaza la clave API (401). Crea otra en Settings > API y "
-                                       "pégala de nuevo en 'Clave API'.")
-                raise
-            self.dispositivo = "cuda"
-            ejemplo = cuerpo_voxtral(self.props, self.modelo, "...", self.nombre_voz)
-            log(f"Voxtral vía Unsloth ({self.url}), modelo {self.modelo}, voz {self.nombre_voz}")
-            log("Campos que se envían: " + ", ".join(f"{k}={v!r}" for k, v in ejemplo.items() if k != "input"))
+                url = arrancar_crispasr(usar_gpu, log)
+            except Exception as e:
+                causa = str(e)
+        if url:
+            self.url = url
+            self.dispositivo = "cuda" if usar_gpu else "cpu"
+            log(f"Voxtral listo ({url}), voz {self.nombre_voz}")
             return
-        self.modo = "cli"
-        self.exe = buscar_crispasr()
-        if not self.exe:
-            raise RuntimeError(
-                "No encuentro Voxtral: abre Unsloth Studio, carga Voxtral TTS, crea una clave en "
-                "Ajustes > API y pégala aquí; o indica crispasr.exe.")
-        self.gguf = buscar_gguf_voxtral()
-        self.dispositivo = "cuda" if usar_gpu else "cpu"
-        log(f"Voxtral: {Path(self.gguf).name if self.gguf else 'auto'} con {Path(self.exe).name}, "
-            f"voz {self.nombre_voz}")
+        self.clave = aj.get("vx_clave") or os.environ.get("UNSLOTH_API_KEY", "")
+        self.url = buscar_servidor_unsloth() if self.clave else ""
+        if not self.url:
+            raise RuntimeError("No se pudo preparar Voxtral: " + (causa or "sin motor disponible"))
+        log("No se pudo usar CrispASR (" + causa.splitlines()[0][:120] + "); se usa Unsloth.")
+        self.modo = "api"
+        try:
+            self.modelo = _modelo_api(self.url, self.clave)
+            self.props = campos_speech(self.url, self.clave)
+            self._elegir_voz()
+        except RuntimeError as e:
+            if "401" in str(e):
+                raise RuntimeError("Unsloth rechaza la clave API (401).")
+            raise
+        self.dispositivo = "cuda"
+        log(f"Voxtral vía Unsloth ({self.url}), modelo {self.modelo}, voz {self.nombre_voz}")
 
     def _elegir_voz(self):
         """Comprueba que la voz existe en el servidor (si no, Voxtral usaria una voz inglesa por defecto)."""
@@ -1045,6 +1149,13 @@ class SintVoxtral:
         return np.asarray(a, dtype="float32").reshape(-1)
 
     def _sintetizar(self, texto, semilla):
+        if self.modo == "crisp":
+            cuerpo = {"input": texto, "voice": self.nombre_voz, "language": "es",
+                      "response_format": "wav", "seed": int(semilla) + 1}
+            datos, tipo = _http(self.url + "/v1/audio/speech", "", cuerpo, timeout=900)
+            if "json" in tipo.lower():
+                raise RuntimeError(f"Respuesta inesperada de Voxtral: {datos[:300].decode('utf-8', 'replace')}")
+            return self._leer(datos)
         if self.modo == "api":
             # variantes de la peticion, de la mas completa a la mas simple; se recuerda la que el servidor acepta
             variantes = [(True, True), (True, False), (False, True), (False, False)]
@@ -1065,20 +1176,6 @@ class SintVoxtral:
             if "json" in tipo.lower():
                 raise RuntimeError(f"Respuesta inesperada de Unsloth: {datos[:300].decode('utf-8', 'replace')}")
             return self._leer(datos)
-        with tempfile.TemporaryDirectory() as d:
-            out = Path(d) / "o.wav"
-            cmd = [self.exe, "--backend", "voxtral-tts"]
-            cmd += ["-m", self.gguf] if self.gguf else ["-m", "auto", "--auto-download"]
-            cmd += ["--tts", texto, "--voice", self.nombre_voz, "--tts-output", str(out), "--seed", str(semilla)]
-            env = dict(os.environ)
-            if not self.usar_gpu:
-                env["CUDA_VISIBLE_DEVICES"] = ""
-            r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, env=env, timeout=900,
-                               creationflags=0x08000000 if os.name == "nt" else 0)
-            if r.returncode != 0 or not out.exists():
-                cola = (r.stderr or r.stdout or b"").decode("utf-8", "replace")[-600:]
-                raise RuntimeError(f"CrispASR falló (código {r.returncode}): {cola}")
-            return self._leer(out.read_bytes())
 
     def __call__(self, texto):
         import numpy as np
@@ -1693,17 +1790,16 @@ def gui():
             vx = self.motor() == "voxtral"
             for fila in self.fila_vx:
                 for w in fila:
-                    w.grid() if vx else w.grid_remove()
+                    w.grid_remove()          # Voxtral ya no necesita URL ni clave: se gestiona solo
             if self.motor() == "kokoro":
                 vals = [f"{k}  |  {v}" for k, v in VOCES.items()]
                 self.v_info.set("Rápido: Kokoro, pronuncia con la fonética de España (c/z como 'th'). "
                                 "Ideal para libros largos; funciona en CPU y GPU.")
             elif vx:
                 vals = [f"{k}  |  {v}" for k, v in VX_VOCES.items()]
-                self.v_info.set("Voxtral (Mistral, 4B): voz muy natural, solo para uso personal (licencia no "
-                                "comercial). Se ejecuta en Unsloth Studio: ábrelo, carga Voxtral TTS y pega aquí "
-                                "la clave de Ajustes > API. Las voces son las incluidas en el modelo (no hace "
-                                "falta cargarlas); puedes escribir el nombre de otra en el desplegable.")
+                self.v_info.set("Voxtral (Mistral, 4B): voz muy natural, solo uso personal (licencia no comercial). "
+                                "Elige 'Español - hombre/mujer'. La primera vez se descarga solo (motor + modelo, "
+                                "unos 2-4 GB); no hace falta instalar nada más.")
             else:
                 vals = [f"{k}  |  {v['etiqueta']}" for k, v in CB_VOCES.items()]
                 self.v_info.set("Alta calidad: Chatterbox con el paquete de España. Imita la voz y el acento del "
@@ -1712,8 +1808,6 @@ def gui():
             self.cb_voz.config(values=vals, state="normal" if vx else "readonly")
             self.v_voz.set(vals[0])
             self.cambia_voz()
-            if vx and self.v_vx_clave.get().strip():
-                self.cargar_voces_vx()
 
         def cambia_voz(self):
             propia = self.voz() == "cb:propia"

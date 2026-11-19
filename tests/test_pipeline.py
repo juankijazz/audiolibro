@@ -180,10 +180,12 @@ class Pipeline(unittest.TestCase):
 
         srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
-        old = {k: os.environ.get(k) for k in ("AUDIOLIBRO_VOXTRAL_URL", "AUDIOLIBRO_DATOS", "UNSLOTH_API_KEY")}
+        old = {k: os.environ.get(k) for k in ("AUDIOLIBRO_VOXTRAL_URL", "AUDIOLIBRO_DATOS", "UNSLOTH_API_KEY",
+                                              "AUDIOLIBRO_SIN_CRISPASR")}
         with tempfile.TemporaryDirectory() as d:
             os.environ.update(AUDIOLIBRO_VOXTRAL_URL=f"http://127.0.0.1:{srv.server_port}",
-                              AUDIOLIBRO_DATOS=d, UNSLOTH_API_KEY="sk-unsloth-prueba")
+                              AUDIOLIBRO_DATOS=d, UNSLOTH_API_KEY="sk-unsloth-prueba",
+                              AUDIOLIBRO_SIN_CRISPASR="1")
             try:
                 self.assertEqual(A.motor_de("vx:es_female"), "voxtral")
                 A.guardar_ajustes(vx_modelo=None)
@@ -208,6 +210,49 @@ class Pipeline(unittest.TestCase):
                         os.environ.pop(k, None)
                     else:
                         os.environ[k] = v
+
+    def test_voxtral_via_crispasr_falso(self):
+        """Voxtral con el servidor CrispASR (simulado): la voz va tal cual en 'voice'."""
+        import http.server
+        import io
+        import json as _json
+        import numpy as np
+        import soundfile as sf
+        pedidos = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                n = int(self.headers["Content-Length"])
+                pedidos.append(_json.loads(self.rfile.read(n)))
+                dur = max(1.0, len(pedidos[-1]["input"]) / 15.0)
+                x = (0.2 * np.sin(2 * np.pi * 220 * np.arange(int(24000 * dur)) / 24000)).astype("float32")
+                b = io.BytesIO()
+                sf.write(b, x, 24000, format="WAV")
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/wav")
+                self.end_headers()
+                self.wfile.write(b.getvalue())
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        old = os.environ.get("AUDIOLIBRO_CRISPASR_URL")
+        os.environ["AUDIOLIBRO_CRISPASR_URL"] = f"http://127.0.0.1:{srv.server_port}"
+        try:
+            s = A.Sintetizador("vx:es_male", 1.0, True, lambda *_: None)
+            a = s("Hola, esto es una prueba de la voz en español de Voxtral.")
+            self.assertEqual(s.modo, "crisp")
+            self.assertGreater(len(a) / A.SAMPLE_RATE, 2.0)
+            self.assertEqual((pedidos[0]["voice"], pedidos[0]["language"]), ("es_male", "es"))
+            self.assertIn("vx:es_female", A.VX_VOCES)
+        finally:
+            srv.shutdown()
+            if old is None:
+                os.environ.pop("AUDIOLIBRO_CRISPASR_URL", None)
+            else:
+                os.environ["AUDIOLIBRO_CRISPASR_URL"] = old
 
     def test_cuerpo_voxtral_segun_esquema(self):
         c = A.cuerpo_voxtral({}, "m", "hola", "es_male")

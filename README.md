@@ -26,4 +26,4 @@ Cada push ejecuta en Windows: pruebas, síntesis real con Kokoro (CPU), compilac
 
 - **Rápido – Kokoro** (CPU o GPU): pronunciación de España.
 - **Alta calidad – Chatterbox España** (GPU): sintetiza 8 trozos a la vez (`AUDIOLIBRO_LOTE` o `--lote N`); `--bench --lote 1,4,8` mide la velocidad real.
-- **Voxtral (Mistral 4B)**: se ejecuta en **Unsloth Studio**. Carga el modelo en Studio, crea una clave en *Settings → API* y pega la URL (p. ej. `http://localhost:8888`) y la clave en la aplicación (o `--vx-url`, `--vx-clave`). `--vx-probar` muestra los modelos y voces que ve el servidor. Licencia CC BY-NC 4.0 (uso no comercial).
+- **Voxtral (Mistral 4B)**: la aplicación descarga y arranca sola el motor [CrispASR](https://github.com/CrispStrobe/CrispASR) (`crispasr-windows-x86_64-cuda.zip`) y el modelo (2-4 GB, solo la primera vez). Eliges la voz incrustada en el modelo (`es_male`, `es_female`, ...) en el desplegable; no hace falta Unsloth ni claves. Si ya tienes un servidor CrispASR, indica `AUDIOLIBRO_CRISPASR_URL`. Unsloth Studio queda solo como alternativa si hay clave guardada. Licencia CC BY-NC 4.0 (uso no comercial).
