@@ -1965,6 +1965,10 @@ def gui():
                                 "audio de referencia (puedes poner el tuyo). Más lento y necesita GPU; la primera "
                                 "vez descarga unos 4,3 GB.")
             self.cb_voz.config(values=vals, state="normal" if vx else "readonly")
+            # Chatterbox suena mas natural en narracion algo mas pausada
+            vel = 0.9 if self.motor() == "chatterbox" else 1.0
+            self.v_vel.set(vel)
+            self.lbl_vel.config(text=f"{vel:.2f}x")
             self.v_voz.set(vals[0])
             self.cambia_voz()
 

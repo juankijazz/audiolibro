@@ -122,6 +122,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release delete latest --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" || true
-          gh release create latest dist/Audiolibro.exe voces/*.wav --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+          REFS=$(ls voces/referencias/*.wav 2>/dev/null || true)
+          gh release create latest dist/Audiolibro.exe voces/*.wav $REFS --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "Audiolibro.exe (ultima version)" \
             --notes "Doble clic en Audiolibro.exe. La primera vez instala todo lo necesario (varios GB con GPU NVIDIA); despues abre la aplicacion directamente. Los .wav son muestras de cada voz (Kokoro y Chatterbox Espana) para escuchar el acento antes de instalar."
