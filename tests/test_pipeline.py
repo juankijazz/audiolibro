@@ -208,6 +208,17 @@ class Pipeline(unittest.TestCase):
                     else:
                         os.environ[k] = v
 
+    def test_cuerpo_voxtral_segun_esquema(self):
+        c = A.cuerpo_voxtral({}, "m", "hola", "es_male")
+        self.assertEqual((c["voice"], c["language"]), ("es_male", "Spanish"))
+        props = {"input": {"type": "string"}, "voice_id": {"type": "string"}, "lang": {"type": "string"},
+                 "num_inference_steps": {"type": "integer"}, "voice_sample": {"type": "string"}}
+        c = A.cuerpo_voxtral(props, "m", "hola", "es_male")
+        self.assertEqual((c["voice"], c["voice_id"], c["lang"], c["num_inference_steps"]),
+                         ("es_male", "es_male", "Spanish", 7))
+        self.assertNotIn("voice_sample", c)
+        self.assertNotIn("language", A.cuerpo_voxtral(props, "m", "hola", "es_male", False))
+
     def test_motor_por_lotes_conserva_el_orden(self):
         """Con un motor por lotes, el audio final queda en el mismo orden que el texto."""
         import numpy as np

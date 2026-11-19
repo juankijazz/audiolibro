@@ -880,6 +880,43 @@ def es_voz_espanola(vid, nombre=""):
     return bool(re.search(r"(^|[\W_])es([\W_]|$)|spanish|espa[nñ]|castellano|spain", t))
 
 
+def campos_speech(url, clave):
+    """Campos que admite POST /v1/audio/speech segun /openapi.json del servidor ({} si no se puede leer)."""
+    try:
+        datos, _ = _http(url + "/openapi.json", clave, timeout=10)
+        api = json.loads(datos.decode("utf-8"))
+        cuerpo = api.get("paths", {}).get("/v1/audio/speech", {}).get("post", {}).get("requestBody", {})
+        esquema = (cuerpo.get("content", {}).get("application/json", {}) or {}).get("schema", {})
+        ref = esquema.get("$ref", "")
+        if ref:
+            esquema = api.get("components", {}).get("schemas", {}).get(ref.split("/")[-1], esquema)
+        props = esquema.get("properties", {})
+        return props if isinstance(props, dict) else {}
+    except Exception:
+        return {}
+
+
+def cuerpo_voxtral(props, modelo, texto, voz, con_idioma=True):
+    """Cuerpo de la peticion: se adapta a los nombres de campo reales del servidor."""
+    cuerpo = {"model": modelo, "input": texto, "voice": voz, "response_format": "wav"}
+    for k, v in (props or {}).items():
+        lk, tipo = k.lower(), (v or {}).get("type")
+        if k in cuerpo:
+            continue
+        if ("voice" in lk or "speaker" in lk) and tipo in (None, "string") and "sample" not in lk \
+                and "clon" not in lk and "ref" not in lk:
+            cuerpo[k] = voz                      # p. ej. voice_id: la misma voz en todos los campos de voz
+        elif con_idioma and lk in ("language", "lang", "language_id", "lang_code"):
+            enum = [e for e in ((v or {}).get("enum") or []) if isinstance(e, str)]
+            cuerpo[k] = next((e for e in enum if e.lower() in ("es", "spanish", "español", "es-es")),
+                             enum[0] if enum else "Spanish")
+        elif "step" in lk and tipo == "integer":
+            cuerpo[k] = 7                        # los mismos pasos que usa el panel de Unsloth
+    if con_idioma and not any(k.lower() in ("language", "lang", "language_id", "lang_code") for k in cuerpo):
+        cuerpo["language"] = "Spanish"
+    return cuerpo
+
+
 def diagnostico_voxtral(url, clave):
     """Texto con lo que responde el servidor: voces en bruto y campos admitidos por /v1/audio/speech."""
     lineas = []
@@ -944,6 +981,7 @@ class SintVoxtral:
                     "(empieza por sk-unsloth-) y pégala en el campo 'Clave API' de Audiolibro.")
             try:
                 self.modelo = _modelo_api(self.url, self.clave)
+                self.props = campos_speech(self.url, self.clave)
                 self._elegir_voz()
             except RuntimeError as e:
                 if "401" in str(e):
@@ -951,7 +989,9 @@ class SintVoxtral:
                                        "pégala de nuevo en 'Clave API'.")
                 raise
             self.dispositivo = "cuda"
+            ejemplo = cuerpo_voxtral(self.props, self.modelo, "...", self.nombre_voz)
             log(f"Voxtral vía Unsloth ({self.url}), modelo {self.modelo}, voz {self.nombre_voz}")
+            log("Campos que se envían: " + ", ".join(f"{k}={v!r}" for k, v in ejemplo.items() if k != "input"))
             return
         self.modo = "cli"
         self.exe = buscar_crispasr()
@@ -1001,15 +1041,14 @@ class SintVoxtral:
 
     def _sintetizar(self, texto, semilla):
         if self.modo == "api":
-            cuerpo = {"model": self.modelo, "input": texto, "voice": self.nombre_voz, "response_format": "wav"}
-            if getattr(self, "con_idioma", True):
-                cuerpo["language"] = "Spanish"
+            cuerpo = cuerpo_voxtral(getattr(self, "props", {}), self.modelo, texto, self.nombre_voz,
+                                    getattr(self, "con_idioma", True))
             try:
                 datos, tipo = _http(self.url + "/v1/audio/speech", self.clave, cuerpo, timeout=900)
             except RuntimeError as e:
-                if "language" in cuerpo and ("422" in str(e) or "400" in str(e)):
+                if getattr(self, "con_idioma", True) and ("422" in str(e) or "400" in str(e)):
                     self.con_idioma = False                   # este servidor no admite el campo: se reintenta sin él
-                    cuerpo.pop("language")
+                    cuerpo = cuerpo_voxtral(getattr(self, "props", {}), self.modelo, texto, self.nombre_voz, False)
                     datos, tipo = _http(self.url + "/v1/audio/speech", self.clave, cuerpo, timeout=900)
                 else:
                     raise
