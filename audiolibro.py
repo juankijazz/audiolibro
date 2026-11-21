@@ -914,7 +914,9 @@ def arrancar_crispasr(usar_gpu, log=print):
         cmd.append("--no-gpu")
     reg = datos / "crispasr.log"
     log("Arrancando Voxtral (la primera vez descarga el modelo, unos 2-4 GB)...")
-    salida = open(reg, "wb")
+    salida = open(reg, "ab")
+    salida.write(("\n=== arranque %s ===\n" % time.strftime("%Y-%m-%d %H:%M:%S")).encode())
+    salida.flush()
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=salida, stderr=subprocess.STDOUT, env=env,
                             creationflags=0x08000000 if os.name == "nt" else 0)
     atexit.register(lambda: proc.poll() is None and proc.terminate())
@@ -939,6 +941,31 @@ def arrancar_crispasr(usar_gpu, log=print):
         time.sleep(2)
     _CRISP["proc"], _CRISP["url"] = proc, url
     return url
+
+
+def cola_log_crisp(n=1500):
+    """Ultimas lineas del registro del motor de Voxtral (crispasr.log)."""
+    try:
+        return (_dir_datos() / "crispasr.log").read_bytes()[-n:].decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+
+def reiniciar_crispasr(usar_gpu, log=print):
+    """Cierra el motor de Voxtral que arranco la aplicacion y lo vuelve a arrancar."""
+    p = _CRISP["proc"]
+    if p is None:
+        raise RuntimeError("El servidor de Voxtral es externo: no se puede reiniciar desde aquí.")
+    try:
+        p.terminate()
+        p.wait(timeout=10)
+    except Exception:
+        try:
+            p.kill()
+        except Exception:
+            pass
+    _CRISP["proc"], _CRISP["url"] = None, ""
+    return arrancar_crispasr(usar_gpu, log)
 
 
 def _http(url, clave="", cuerpo=None, timeout=30):
@@ -1110,6 +1137,7 @@ class SintVoxtral:
         self.dispositivo = "falso"
         self.vacios = 0
         self.reintentos = 0
+        self.caidas = 0
         if falso:
             return
         self.nombre_voz = str(voz)[3:]
@@ -1182,14 +1210,48 @@ class SintVoxtral:
             a = np.interp(np.linspace(0, len(a) - 1, n), np.arange(len(a)), a).astype("float32")
         return np.asarray(a, dtype="float32").reshape(-1)
 
+    def _post_crisp(self, texto, semilla):
+        cuerpo = {"input": texto, "voice": self.nombre_voz, "language": "es",
+                  "response_format": "wav", "seed": int(semilla) + 1}
+        datos, tipo = _http(self.url + "/v1/audio/speech", "", cuerpo, timeout=900)
+        if "json" in tipo.lower():
+            raise RuntimeError(f"Respuesta inesperada de Voxtral: {datos[:300].decode('utf-8', 'replace')}")
+        return self._leer(datos)
+
+    def _sintetizar_crisp(self, texto, semilla, nivel=0):
+        """Si el motor se corta a media peticion lo reinicia; si un texto lo vuelve a tumbar, lo parte en dos."""
+        import http.client
+        import numpy as np
+        ultimo = None
+        for _ in range(2):
+            try:
+                return self._post_crisp(texto, semilla)
+            except (OSError, http.client.HTTPException) as e:
+                ultimo = e
+                self.caidas += 1
+                self.log(f"Voxtral se cortó ({type(e).__name__}); reinicio el motor y reintento...")
+                try:
+                    self.url = reiniciar_crispasr(self.usar_gpu, self.log)
+                except RuntimeError as e2:
+                    self.log(str(e2))
+                    break
+        if nivel < 3 and len(texto) > 60:
+            mid = len(texto) // 2
+            cortes = [m.end() for m in re.finditer(r"[.;:,] |\s", texto) if 20 < m.end() < len(texto) - 20]
+            if cortes:
+                c = min(cortes, key=lambda x: abs(x - mid))
+                self.log("Voxtral falla con este fragmento; lo divido en dos.")
+                izq = self._sintetizar_crisp(texto[:c].strip(), semilla, nivel + 1)
+                der = self._sintetizar_crisp(texto[c:].strip(), semilla, nivel + 1)
+                return np.concatenate([izq, np.zeros(int(0.15 * SAMPLE_RATE), dtype="float32"), der])
+        raise RuntimeError(
+            f"El motor de Voxtral se cierra al sintetizar ({type(ultimo).__name__}). Si se repite, prueba con "
+            f"Chatterbox o Kokoro y envía el registro (carpeta %LOCALAPPDATA%\\Audiolibro\\crispasr.log). "
+            f"Final del registro:\n{cola_log_crisp()}")
+
     def _sintetizar(self, texto, semilla):
         if self.modo == "crisp":
-            cuerpo = {"input": texto, "voice": self.nombre_voz, "language": "es",
-                      "response_format": "wav", "seed": int(semilla) + 1}
-            datos, tipo = _http(self.url + "/v1/audio/speech", "", cuerpo, timeout=900)
-            if "json" in tipo.lower():
-                raise RuntimeError(f"Respuesta inesperada de Voxtral: {datos[:300].decode('utf-8', 'replace')}")
-            return self._leer(datos)
+            return self._sintetizar_crisp(texto, semilla)
         if self.modo == "api":
             # variantes de la peticion, de la mas completa a la mas simple; se recuerda la que el servidor acepta
             variantes = [(True, True), (True, False), (False, True), (False, False)]

@@ -1,4 +1,5 @@
 """Pruebas del pipeline con voz simulada (no necesitan GPU ni modelo)."""
+import json
 import os
 import re
 import subprocess
@@ -253,6 +254,60 @@ class Pipeline(unittest.TestCase):
                 os.environ.pop("AUDIOLIBRO_CRISPASR_URL", None)
             else:
                 os.environ["AUDIOLIBRO_CRISPASR_URL"] = old
+
+    def test_voxtral_crispasr_se_recupera_si_el_motor_se_cae(self):
+        import http.server
+        import io
+        import numpy as np
+        import soundfile as sf
+
+        class Malo(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))      # y corta sin responder
+
+        class Bueno(Malo):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers["Content-Length"]))
+                dur = max(1.0, len(json.loads(body)["input"]) / 15.0)
+                x = (0.2 * np.sin(2 * np.pi * 220 * np.arange(int(24000 * dur)) / 24000)).astype("float32")
+                b = io.BytesIO()
+                sf.write(b, x, 24000, format="WAV")
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/wav")
+                self.end_headers()
+                self.wfile.write(b.getvalue())
+
+        malo = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Malo)
+        bueno = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Bueno)
+        for sv in (malo, bueno):
+            threading.Thread(target=sv.serve_forever, daemon=True).start()
+        url_b = f"http://127.0.0.1:{bueno.server_port}"
+        old_env = os.environ.get("AUDIOLIBRO_CRISPASR_URL")
+        old_rei = A.reiniciar_crispasr
+        os.environ["AUDIOLIBRO_CRISPASR_URL"] = f"http://127.0.0.1:{malo.server_port}"
+        try:
+            A.reiniciar_crispasr = lambda gpu, log=print: url_b
+            s = A.Sintetizador("vx:es_male", 1.0, True, lambda *_: None)
+            a = s("Hola, esto es una prueba tras reiniciar el motor de Voxtral.")
+            self.assertGreater(len(a) / A.SAMPLE_RATE, 2.0)
+            self.assertEqual(s.caidas, 1)
+            # si el motor sigue cayendo, el error es claro y menciona el registro
+            A.reiniciar_crispasr = lambda gpu, log=print: f"http://127.0.0.1:{malo.server_port}"
+            s2 = A.Sintetizador("vx:es_male", 1.0, True, lambda *_: None)
+            with self.assertRaises(RuntimeError) as cm:
+                s2("Texto corto.")
+            self.assertIn("crispasr.log", str(cm.exception))
+        finally:
+            A.reiniciar_crispasr = old_rei
+            malo.shutdown()
+            bueno.shutdown()
+            if old_env is None:
+                os.environ.pop("AUDIOLIBRO_CRISPASR_URL", None)
+            else:
+                os.environ["AUDIOLIBRO_CRISPASR_URL"] = old_env
 
     def test_referencia_masculina_desde_kokoro(self):
         old = A.DIR_MODELOS
