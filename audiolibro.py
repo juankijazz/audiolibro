@@ -1218,10 +1218,20 @@ class SintVoxtral:
         self.usar_gpu = usar_gpu
         self.modo = "crisp"
         aj = cargar_ajustes()
-        # 1) un servidor CrispASR ya en marcha (AUDIOLIBRO_CRISPASR_URL o ajustes); 2) arrancarlo aqui
-        #    (se descarga solo); 3) como ultimo recurso, Unsloth Studio si hay clave guardada.
+        self.clave = aj.get("vx_clave") or os.environ.get("UNSLOTH_API_KEY", "")
+        # Orden: 1) un servidor CrispASR externo indicado a mano (AUDIOLIBRO_CRISPASR_URL o ajustes);
+        # 2) Unsloth Studio si esta abierto con Voxtral cargado (pesos originales, sin cuantizar: mejor voz
+        #    y menos frases desbocadas); 3) arrancar CrispASR aqui (se descarga solo); 4) Unsloth a la fuerza.
         url = (os.environ.get("AUDIOLIBRO_CRISPASR_URL") or aj.get("vx_crisp_url") or "").rstrip("/")
         causa = ""
+        if not url and self.clave and not os.environ.get("AUDIOLIBRO_SIN_UNSLOTH"):
+            u = buscar_servidor_unsloth()
+            if u:
+                try:
+                    self._usar_unsloth(u, exigir_voxtral=True)
+                    return
+                except Exception as e:
+                    log(f"Unsloth Studio no sirve ahora ({str(e).splitlines()[0][:120]}); uso CrispASR.")
         if not url:
             try:
                 url = arrancar_crispasr(usar_gpu, log)
@@ -1232,22 +1242,28 @@ class SintVoxtral:
             self.dispositivo = "cuda" if usar_gpu else "cpu"
             log(f"Voxtral listo ({url}), voz {self.nombre_voz}")
             return
-        self.clave = aj.get("vx_clave") or os.environ.get("UNSLOTH_API_KEY", "")
-        self.url = buscar_servidor_unsloth() if self.clave else ""
-        if not self.url:
+        u = buscar_servidor_unsloth() if self.clave else ""
+        if not u:
             raise RuntimeError("No se pudo preparar Voxtral: " + (causa or "sin motor disponible"))
         log("No se pudo usar CrispASR (" + causa.splitlines()[0][:120] + "); se usa Unsloth.")
-        self.modo = "api"
+        self._usar_unsloth(u)
+
+    def _usar_unsloth(self, url, exigir_voxtral=False):
+        """Voxtral servido por Unsloth Studio (/v1/audio/speech, OpenAI compatible)."""
+        self.url = url
         try:
             self.modelo = _modelo_api(self.url, self.clave)
+            if exigir_voxtral and "voxtral" not in self.modelo.lower() and not cargar_ajustes().get("vx_modelo"):
+                raise RuntimeError(f"el modelo cargado en Unsloth es '{self.modelo}', no Voxtral")
             self.props = campos_speech(self.url, self.clave)
             self._elegir_voz()
         except RuntimeError as e:
             if "401" in str(e):
                 raise RuntimeError("Unsloth rechaza la clave API (401).")
             raise
+        self.modo = "api"
         self.dispositivo = "cuda"
-        log(f"Voxtral vía Unsloth ({self.url}), modelo {self.modelo}, voz {self.nombre_voz}")
+        self.log(f"Voxtral vía Unsloth ({self.url}), modelo {self.modelo}, voz {self.nombre_voz}")
 
     def _elegir_voz(self):
         """Comprueba que la voz existe en el servidor (si no, Voxtral usaria una voz inglesa por defecto)."""

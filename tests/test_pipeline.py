@@ -185,14 +185,18 @@ class Pipeline(unittest.TestCase):
                                               "AUDIOLIBRO_SIN_CRISPASR")}
         with tempfile.TemporaryDirectory() as d:
             os.environ.update(AUDIOLIBRO_VOXTRAL_URL=f"http://127.0.0.1:{srv.server_port}",
-                              AUDIOLIBRO_DATOS=d, UNSLOTH_API_KEY="sk-unsloth-prueba",
-                              AUDIOLIBRO_SIN_CRISPASR="1")
+                              AUDIOLIBRO_DATOS=d, UNSLOTH_API_KEY="sk-unsloth-prueba")
+            os.environ.pop("AUDIOLIBRO_SIN_CRISPASR", None)
+            arranques = []
+            old_arr = A.arrancar_crispasr
+            A.arrancar_crispasr = lambda *a, **k: arranques.append(1) or "http://127.0.0.1:9"
             try:
                 self.assertEqual(A.motor_de("vx:es_female"), "voxtral")
                 A.guardar_ajustes(vx_modelo=None)
                 s = A.Sintetizador("vx:es_female", 1.0, True, lambda *_: None)
                 a = s("Hola, esto es una prueba de la voz de Voxtral en español.")
                 self.assertEqual(s.modelo, "Voxtral-4B-TTS-2603-GGUF")
+                self.assertEqual((s.modo, arranques), ("api", []))   # Unsloth abierto: preferido a CrispASR
                 self.assertGreater(len(a) / A.SAMPLE_RATE, 2.0)          # remuestreado a 24 kHz
                 self.assertEqual(pedidos[0][0], "Bearer sk-unsloth-prueba")
                 self.assertEqual(pedidos[0][1]["voice"], "es_female")
@@ -205,6 +209,7 @@ class Pipeline(unittest.TestCase):
                 self.assertTrue(A.es_voz_espanola("es_female") and not A.es_voz_espanola("casual_male"))
                 self.assertEqual(pedidos[0][1]["response_format"], "wav")
             finally:
+                A.arrancar_crispasr = old_arr
                 srv.shutdown()
                 for k, v in old.items():
                     if v is None:
