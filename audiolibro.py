@@ -834,7 +834,71 @@ def buscar_crispasr():
     return ""
 
 
-_CRISP = {"proc": None, "url": ""}
+_CRISP = {"proc": None, "url": "", "job": None}
+
+# Tope de memoria (RAM comprometida) para crispasr.exe. Voxtral a veces no emite [END] y genera hasta su
+# limite fijo de 2000 tramas (160 s) aunque la frase dure 3 s. Al decodificar esas 2000 tramas el codec
+# reserva ~11 GB de RAM (sesgos ALiBi densos T x T x 8 cabezas) y otros tantos de VRAM: la 5080 se desborda
+# a la memoria compartida y Windows se queda congelado minutos. Con el tope, esa reserva falla, crispasr se
+# cierra solo, la app lo reinicia y reintenta con otra semilla. Una frase normal (<60 s) necesita < 2 GB.
+VX_MEM_GB = float(os.environ.get("AUDIOLIBRO_VX_MEM_GB") or 8)
+
+
+def _encerrar_en_job(proc, gb):
+    """Windows: mete el proceso en un Job Object con tope de memoria y 'matar al cerrar' (si la app se
+    cierra o se cae, crispasr muere con ella y no se queda ocupando la GPU). Devuelve el handle o None."""
+    if os.name != "nt" or not gb or gb <= 0:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _IO(ctypes.Structure):
+            _fields_ = [(n, ctypes.c_ulonglong) for n in ("ro", "wo", "oo", "rt", "wt", "ot")]
+
+        class _BASIC(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                        ("LimitFlags", ctypes.c_uint32), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", ctypes.c_uint32),
+                        ("Affinity", ctypes.c_size_t), ("PriorityClass", ctypes.c_uint32),
+                        ("SchedulingClass", ctypes.c_uint32)]
+
+        class _EXT(ctypes.Structure):
+            _fields_ = [("BasicLimitInformation", _BASIC), ("IoInfo", _IO),
+                        ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                        ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        job = k32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        info = _EXT()
+        info.BasicLimitInformation.LimitFlags = 0x100 | 0x2000   # PROCESS_MEMORY | KILL_ON_JOB_CLOSE
+        info.ProcessMemoryLimit = int(gb * 2 ** 30)
+        ok = k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info))  # 9 = Extended
+        if ok:
+            ok = k32.AssignProcessToJobObject(job, wintypes.HANDLE(int(proc._handle)))
+        if not ok:
+            k32.CloseHandle(job)
+            return None
+        return job
+    except Exception:
+        return None
+
+
+def _cerrar_job():
+    job, _CRISP["job"] = _CRISP.get("job"), None
+    if job and os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.kernel32.CloseHandle(job)
+        except Exception:
+            pass
 
 
 def _descargar(url, destino, log, etiqueta):
@@ -917,8 +981,13 @@ def arrancar_crispasr(usar_gpu, log=print):
     salida = open(reg, "ab")
     salida.write(("\n=== arranque %s ===\n" % time.strftime("%Y-%m-%d %H:%M:%S")).encode())
     salida.flush()
+    # 0x08000000 = sin ventana; 0x00004000 = prioridad "por debajo de lo normal" (el escritorio sigue fluido)
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=salida, stderr=subprocess.STDOUT, env=env,
-                            creationflags=0x08000000 if os.name == "nt" else 0)
+                            creationflags=(0x08000000 | 0x00004000) if os.name == "nt" else 0)
+    _cerrar_job()
+    _CRISP["job"] = _encerrar_en_job(proc, VX_MEM_GB)
+    if os.name == "nt" and VX_MEM_GB > 0 and not _CRISP["job"]:
+        log("Aviso: no se pudo poner el tope de memoria al motor de Voxtral.")
     atexit.register(lambda: proc.poll() is None and proc.terminate())
     t0, ult = time.time(), 0
     while True:
@@ -964,6 +1033,7 @@ def reiniciar_crispasr(usar_gpu, log=print):
             p.kill()
         except Exception:
             pass
+    _cerrar_job()
     _CRISP["proc"], _CRISP["url"] = None, ""
     return arrancar_crispasr(usar_gpu, log)
 
@@ -1233,16 +1303,19 @@ class SintVoxtral:
         import numpy as np
         ultimo = None
         sin_audio = False
-        for _ in range(2):
+        # Con la misma semilla Voxtral repite exactamente la misma generacion: si se desboco (no emitio [END],
+        # 160 s de audio y el motor cerrado por el tope de memoria), reintentar igual volveria a desbocarse.
+        for k in range(3):
             try:
-                return self._post_crisp(texto, semilla)
+                return self._post_crisp(texto, semilla + 7919 * k)
             except _SinAudio as e:
                 ultimo, sin_audio = e, True
                 break
             except (OSError, http.client.HTTPException) as e:
                 ultimo = e
                 self.caidas += 1
-                self.log(f"Voxtral se cortó ({type(e).__name__}); reinicio el motor y reintento...")
+                self.log(f"Voxtral se cortó ({type(e).__name__}) en «{texto[:40]}»; "
+                         "reinicio el motor y reintento con otra semilla...")
                 try:
                     self.url = reiniciar_crispasr(self.usar_gpu, self.log)
                 except RuntimeError as e2:

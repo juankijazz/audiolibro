@@ -309,6 +309,64 @@ class Pipeline(unittest.TestCase):
             else:
                 os.environ["AUDIOLIBRO_CRISPASR_URL"] = old_env
 
+    def test_voxtral_desbocado_reintenta_con_otra_semilla(self):
+        """Voxtral es determinista por semilla: si una frase con una semilla tumba el motor (no emite [END],
+        160 s, tope de memoria), el reintento tras reiniciar debe usar OTRA semilla, no la misma."""
+        import http.server
+        import io
+        import numpy as np
+        import soundfile as sf
+        semillas = []
+        mala = {}
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                semillas.append(body["seed"])
+                mala.setdefault("seed", body["seed"])
+                if body["seed"] == mala["seed"]:
+                    return                                   # el motor "muere" con esta semilla, siempre
+                dur = max(1.0, len(body["input"]) / 15.0)
+                x = (0.2 * np.sin(2 * np.pi * 220 * np.arange(int(24000 * dur)) / 24000)).astype("float32")
+                b = io.BytesIO()
+                sf.write(b, x, 24000, format="WAV")
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/wav")
+                self.end_headers()
+                self.wfile.write(b.getvalue())
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        url = f"http://127.0.0.1:{srv.server_port}"
+        old_env = os.environ.get("AUDIOLIBRO_CRISPASR_URL")
+        old_rei = A.reiniciar_crispasr
+        os.environ["AUDIOLIBRO_CRISPASR_URL"] = url
+        try:
+            A.reiniciar_crispasr = lambda gpu, log=print: url
+            s = A.Sintetizador("vx:es_male", 1.0, True, lambda *_: None)
+            a = s("No tiene nada que hacer contra los recuerdos.")
+            self.assertGreater(len(a) / A.SAMPLE_RATE, 1.5)
+            self.assertEqual(s.caidas, 1)
+            self.assertEqual(len(semillas), 2)
+            self.assertNotEqual(semillas[0], semillas[1])
+        finally:
+            A.reiniciar_crispasr = old_rei
+            srv.shutdown()
+            if old_env is None:
+                os.environ.pop("AUDIOLIBRO_CRISPASR_URL", None)
+            else:
+                os.environ["AUDIOLIBRO_CRISPASR_URL"] = old_env
+
+    def test_tope_memoria_motor(self):
+        """El tope de memoria de crispasr deja sitio a frases normales pero no a una de 2000 tramas."""
+        self.assertGreaterEqual(A.VX_MEM_GB, 4)
+        self.assertLess(A.VX_MEM_GB, 11)        # 2000 tramas => ~11 GB solo en sesgos del codec
+        if os.name != "nt":
+            self.assertIsNone(A._encerrar_en_job(None, 8))
+
     def test_voxtral_crispasr_fragmento_sin_audio(self):
         """HTTP 500 'empty audio': se divide el fragmento y, si no hay forma, se omite sin parar el libro."""
         import http.server
