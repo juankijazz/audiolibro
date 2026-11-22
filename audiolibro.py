@@ -950,36 +950,41 @@ def licencia_voxtral_aceptada():
                 or os.environ.get("CRISPASR_ACCEPT_LICENSE", "").lower() == VX_LICENCIA)
 
 
-def arrancar_crispasr(usar_gpu, log=print):
-    """Arranca (una sola vez) el servidor de Voxtral de CrispASR y devuelve su URL."""
+VX_GGUF_Q8 = "https://huggingface.co/cstr/voxtral-4b-tts-GGUF/resolve/main/voxtral-4b-tts-q8_0.gguf"
+
+
+def gguf_voxtral_calidad(log=print):
+    """GGUF de Voxtral para CrispASR en calidad Q8_0 (~4,3 GB; se descarga una vez). '' si no hay forma.
+    Solo vale el formato de CrispASR (cstr/voxtral-4b-tts-GGUF): los GGUF de audio.cpp o de llama.cpp no."""
+    for cand in (cargar_ajustes().get("vx_gguf"), os.environ.get("AUDIOLIBRO_VOXTRAL_GGUF")):
+        if cand and Path(cand).is_file():
+            return str(cand)
+    if os.environ.get("AUDIOLIBRO_VX_Q4"):
+        return ""
+    destino = _dir_datos() / "modelos" / "voxtral-4b-tts-q8_0.gguf"
+    if destino.is_file() and destino.stat().st_size > 3 * 2 ** 30:
+        return str(destino)
+    try:
+        destino.parent.mkdir(parents=True, exist_ok=True)
+        tmp = destino.with_suffix(".part")
+        log("Descargando Voxtral en calidad alta (Q8_0, ~4,3 GB, solo la primera vez)...")
+        _descargar(VX_GGUF_Q8, tmp, log, "Voxtral Q8_0")
+        if tmp.stat().st_size < 3 * 2 ** 30:
+            raise RuntimeError("descarga incompleta")
+        os.replace(tmp, destino)
+        return str(destino)
+    except Exception as e:
+        log(f"No se pudo bajar Voxtral Q8_0 ({str(e)[:100]}); se usa el modelo estándar.")
+        return ""
+
+
+def _lanzar_crispasr(cmd, env, reg, url, log):
+    """Lanza el servidor CrispASR y espera a que responda en /health. Devuelve el proceso."""
     import atexit
-    import socket
     import urllib.request
-    if os.environ.get("AUDIOLIBRO_SIN_CRISPASR"):
-        raise RuntimeError("CrispASR desactivado (AUDIOLIBRO_SIN_CRISPASR).")
-    p = _CRISP["proc"]
-    if p is not None and p.poll() is None and _CRISP["url"]:
-        return _CRISP["url"]
-    if not licencia_voxtral_aceptada():
-        raise RuntimeError(
-            "Voxtral se publica con licencia CC BY-NC 4.0 (solo uso no comercial). Acepta la licencia en el "
-            "aviso de la aplicación, o ejecuta con --vx-licencia / CRISPASR_ACCEPT_LICENSE=cc-by-nc-4.0.")
-    exe = asegurar_crispasr(log)
-    with socket.socket() as sk:
-        sk.bind(("127.0.0.1", 0))
-        puerto = sk.getsockname()[1]
-    url = f"http://127.0.0.1:{puerto}"
-    datos = _dir_datos()
-    datos.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ, CRISPASR_CACHE_DIR=str(datos / "modelos"), CRISPASR_ACCEPT_LICENSE=VX_LICENCIA)
-    cmd = [exe, "--server", "--backend", "voxtral-tts", "-m", "auto", "--auto-download",
-           "--host", "127.0.0.1", "--port", str(puerto)]
-    if not usar_gpu:
-        cmd.append("--no-gpu")
-    reg = datos / "crispasr.log"
-    log("Arrancando Voxtral (la primera vez descarga el modelo, unos 2-4 GB)...")
     salida = open(reg, "ab")
     salida.write(("\n=== arranque %s ===\n" % time.strftime("%Y-%m-%d %H:%M:%S")).encode())
+    salida.write((" ".join(cmd[1:]) + "\n").encode("utf-8", "replace"))
     salida.flush()
     # 0x08000000 = sin ventana; 0x00004000 = prioridad "por debajo de lo normal" (el escritorio sigue fluido)
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=salida, stderr=subprocess.STDOUT, env=env,
@@ -998,7 +1003,7 @@ def arrancar_crispasr(usar_gpu, log=print):
         try:
             with urllib.request.urlopen(url + "/health", timeout=3) as r:
                 if r.status == 200:
-                    break
+                    return proc
         except Exception:
             pass
         if time.time() - t0 > 2400:
@@ -1008,6 +1013,50 @@ def arrancar_crispasr(usar_gpu, log=print):
             ult = time.time()
             log(f"Preparando Voxtral... ({int(time.time() - t0)} s)")
         time.sleep(2)
+
+
+def arrancar_crispasr(usar_gpu, log=print):
+    """Arranca (una sola vez) el servidor de Voxtral de CrispASR y devuelve su URL."""
+    import socket
+    if os.environ.get("AUDIOLIBRO_SIN_CRISPASR"):
+        raise RuntimeError("CrispASR desactivado (AUDIOLIBRO_SIN_CRISPASR).")
+    p = _CRISP["proc"]
+    if p is not None and p.poll() is None and _CRISP["url"]:
+        return _CRISP["url"]
+    if not licencia_voxtral_aceptada():
+        raise RuntimeError(
+            "Voxtral se publica con licencia CC BY-NC 4.0 (solo uso no comercial). Acepta la licencia en el "
+            "aviso de la aplicación, o ejecuta con --vx-licencia / CRISPASR_ACCEPT_LICENSE=cc-by-nc-4.0.")
+    exe = asegurar_crispasr(log)
+    with socket.socket() as sk:
+        sk.bind(("127.0.0.1", 0))
+        puerto = sk.getsockname()[1]
+    url = f"http://127.0.0.1:{puerto}"
+    datos = _dir_datos()
+    datos.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ, CRISPASR_CACHE_DIR=str(datos / "modelos"), CRISPASR_ACCEPT_LICENSE=VX_LICENCIA)
+    reg = datos / "crispasr.log"
+    # Modelo Q8_0 (casi sin perdida) en vez del Q4_K que baja "-m auto": voz mas limpia y menos frases
+    # desbocadas. Si no se puede bajar o CrispASR no lo acepta, se usa el Q4_K de siempre.
+    local = gguf_voxtral_calidad(log)
+    modelos = ([local] if local else []) + ["auto"]
+    for i, modelo in enumerate(modelos):
+        cmd = [exe, "--server", "--backend", "voxtral-tts", "-m", modelo,
+               "--host", "127.0.0.1", "--port", str(puerto)]
+        if modelo == "auto":
+            cmd.insert(cmd.index("--host"), "--auto-download")
+            log("Arrancando Voxtral (la primera vez descarga el modelo, unos 2-4 GB)...")
+        else:
+            log(f"Arrancando Voxtral con {Path(modelo).name}...")
+        if not usar_gpu:
+            cmd.append("--no-gpu")
+        try:
+            proc = _lanzar_crispasr(cmd, env, reg, url, log)
+            break
+        except RuntimeError as e:
+            if i == len(modelos) - 1:
+                raise
+            log(f"CrispASR no acepta {Path(modelo).name} ({str(e).splitlines()[0][:100]}); uso el modelo estándar.")
     _CRISP["proc"], _CRISP["url"] = proc, url
     return url
 
