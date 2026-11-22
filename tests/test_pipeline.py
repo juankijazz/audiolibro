@@ -309,6 +309,51 @@ class Pipeline(unittest.TestCase):
             else:
                 os.environ["AUDIOLIBRO_CRISPASR_URL"] = old_env
 
+    def test_voxtral_crispasr_fragmento_sin_audio(self):
+        """HTTP 500 'empty audio': se divide el fragmento y, si no hay forma, se omite sin parar el libro."""
+        import http.server
+        import io
+        import numpy as np
+        import soundfile as sf
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                texto = json.loads(self.rfile.read(int(self.headers["Content-Length"])))["input"]
+                if len(texto) > 70 or "###" in texto:
+                    self.send_response(500)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"error": {"message": "synthesis failed (backend returned empty audio)", '
+                                     b'"code": "synthesis_failed"}}')
+                    return
+                x = (0.2 * np.sin(2 * np.pi * 220 * np.arange(24000) / 24000)).astype("float32")
+                b = io.BytesIO()
+                sf.write(b, x, 24000, format="WAV")
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/wav")
+                self.end_headers()
+                self.wfile.write(b.getvalue())
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        old = os.environ.get("AUDIOLIBRO_CRISPASR_URL")
+        os.environ["AUDIOLIBRO_CRISPASR_URL"] = f"http://127.0.0.1:{srv.server_port}"
+        try:
+            s = A.Sintetizador("vx:es_male", 1.0, True, lambda *_: None)
+            largo = "Esta frase es larga, bastante larga, y el motor falla con ella; hay que dividirla bien."
+            a = s._sintetizar_crisp(largo, 1)
+            self.assertGreater(len(a), 24000)
+            self.assertEqual(len(s("###")), 0)             # se omite, no lanza excepcion
+        finally:
+            srv.shutdown()
+            if old is None:
+                os.environ.pop("AUDIOLIBRO_CRISPASR_URL", None)
+            else:
+                os.environ["AUDIOLIBRO_CRISPASR_URL"] = old
+
     def test_referencia_masculina_desde_kokoro(self):
         old = A.DIR_MODELOS
         with tempfile.TemporaryDirectory() as d:

@@ -1130,6 +1130,10 @@ def sondear_voxtral(log=print):
     return 0
 
 
+class _SinAudio(RuntimeError):
+    """El motor de Voxtral no devolvio audio para un fragmento (HTTP 500 'empty audio')."""
+
+
 class SintVoxtral:
     """Voxtral TTS: via el servidor de Unsloth Studio (/v1/audio/speech) o, si no, con CrispASR."""
     def __init__(self, voz, velocidad, usar_gpu=True, log=print, falso=False):
@@ -1213,7 +1217,12 @@ class SintVoxtral:
     def _post_crisp(self, texto, semilla):
         cuerpo = {"input": texto, "voice": self.nombre_voz, "language": "es",
                   "response_format": "wav", "seed": int(semilla) + 1}
-        datos, tipo = _http(self.url + "/v1/audio/speech", "", cuerpo, timeout=900)
+        try:
+            datos, tipo = _http(self.url + "/v1/audio/speech", "", cuerpo, timeout=900)
+        except RuntimeError as e:
+            if "empty audio" in str(e) or "synthesis_failed" in str(e):
+                raise _SinAudio(str(e))
+            raise
         if "json" in tipo.lower():
             raise RuntimeError(f"Respuesta inesperada de Voxtral: {datos[:300].decode('utf-8', 'replace')}")
         return self._leer(datos)
@@ -1223,9 +1232,13 @@ class SintVoxtral:
         import http.client
         import numpy as np
         ultimo = None
+        sin_audio = False
         for _ in range(2):
             try:
                 return self._post_crisp(texto, semilla)
+            except _SinAudio as e:
+                ultimo, sin_audio = e, True
+                break
             except (OSError, http.client.HTTPException) as e:
                 ultimo = e
                 self.caidas += 1
@@ -1244,6 +1257,10 @@ class SintVoxtral:
                 izq = self._sintetizar_crisp(texto[:c].strip(), semilla, nivel + 1)
                 der = self._sintetizar_crisp(texto[c:].strip(), semilla, nivel + 1)
                 return np.concatenate([izq, np.zeros(int(0.15 * SAMPLE_RATE), dtype="float32"), der])
+        if sin_audio:
+            # un trozo que Voxtral no sabe pronunciar (solo simbolos, cifras sueltas...) no debe parar el libro
+            self.log(f"Voxtral no genera audio para «{texto[:50]}»; se omite ese fragmento.")
+            return np.zeros(0, dtype="float32")
         raise RuntimeError(
             f"El motor de Voxtral se cierra al sintetizar ({type(ultimo).__name__}). Si se repite, prueba con "
             f"Chatterbox o Kokoro y envía el registro (carpeta %LOCALAPPDATA%\\Audiolibro\\crispasr.log). "
