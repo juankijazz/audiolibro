@@ -950,32 +950,14 @@ def licencia_voxtral_aceptada():
                 or os.environ.get("CRISPASR_ACCEPT_LICENSE", "").lower() == VX_LICENCIA)
 
 
-VX_GGUF_Q8 = "https://huggingface.co/cstr/voxtral-4b-tts-GGUF/resolve/main/voxtral-4b-tts-q8_0.gguf"
-
-
 def gguf_voxtral_calidad(log=print):
-    """GGUF de Voxtral para CrispASR en calidad Q8_0 (~4,3 GB; se descarga una vez). '' si no hay forma.
-    Solo vale el formato de CrispASR (cstr/voxtral-4b-tts-GGUF): los GGUF de audio.cpp o de llama.cpp no."""
+    """GGUF de Voxtral para CrispASR indicado a mano (ajustes vx_gguf o AUDIOLIBRO_VOXTRAL_GGUF); '' = el
+    Q4_K que baja CrispASR. No se descarga nada mas: el motor preferido es Unsloth Studio. Solo vale el formato
+    de CrispASR (cstr/voxtral-4b-tts-GGUF): los GGUF de audio.cpp o de llama.cpp no."""
     for cand in (cargar_ajustes().get("vx_gguf"), os.environ.get("AUDIOLIBRO_VOXTRAL_GGUF")):
         if cand and Path(cand).is_file():
             return str(cand)
-    if os.environ.get("AUDIOLIBRO_VX_Q4"):
-        return ""
-    destino = _dir_datos() / "modelos" / "voxtral-4b-tts-q8_0.gguf"
-    if destino.is_file() and destino.stat().st_size > 3 * 2 ** 30:
-        return str(destino)
-    try:
-        destino.parent.mkdir(parents=True, exist_ok=True)
-        tmp = destino.with_suffix(".part")
-        log("Descargando Voxtral en calidad alta (Q8_0, ~4,3 GB, solo la primera vez)...")
-        _descargar(VX_GGUF_Q8, tmp, log, "Voxtral Q8_0")
-        if tmp.stat().st_size < 3 * 2 ** 30:
-            raise RuntimeError("descarga incompleta")
-        os.replace(tmp, destino)
-        return str(destino)
-    except Exception as e:
-        log(f"No se pudo bajar Voxtral Q8_0 ({str(e)[:100]}); se usa el modelo estándar.")
-        return ""
+    return ""
 
 
 def _lanzar_crispasr(cmd, env, reg, url, log):
@@ -1036,8 +1018,7 @@ def arrancar_crispasr(usar_gpu, log=print):
     datos.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, CRISPASR_CACHE_DIR=str(datos / "modelos"), CRISPASR_ACCEPT_LICENSE=VX_LICENCIA)
     reg = datos / "crispasr.log"
-    # Modelo Q8_0 (casi sin perdida) en vez del Q4_K que baja "-m auto": voz mas limpia y menos frases
-    # desbocadas. Si no se puede bajar o CrispASR no lo acepta, se usa el Q4_K de siempre.
+    # Un GGUF de CrispASR indicado a mano; si no hay o no lo acepta, el Q4_K que baja "-m auto".
     local = gguf_voxtral_calidad(log)
     modelos = ([local] if local else []) + ["auto"]
     for i, modelo in enumerate(modelos):
@@ -1126,19 +1107,37 @@ def buscar_servidor_unsloth():
     return ""
 
 
-def _modelo_api(url, clave):
+def _modelo_api(url, clave, log=print, cargar=True):
+    """Id del modelo Voxtral TTS en Unsloth Studio; si esta descargado pero sin cargar, lo carga.
+    Ojo: en Unsloth puede haber varios 'Voxtral': el de audio.cpp (tarea text-to-speech) es el que funciona;
+    los GGUF de llama.cpp con el mismo nombre no cargan y Voxtral-Mini-Realtime es reconocimiento de voz."""
     aj = cargar_ajustes()
     if aj.get("vx_modelo"):
         return aj["vx_modelo"]
     datos, _ = _http(url + "/v1/models", clave)
     j = json.loads(datos.decode("utf-8"))
-    ids = [m.get("id", "") for m in (j.get("data", j) if isinstance(j, dict) else j)]
-    for i in ids:
-        if "voxtral" in i.lower():
-            return i
-    if ids:
-        return ids[0]
-    raise RuntimeError("Unsloth no tiene ningún modelo cargado: carga Voxtral TTS en Unsloth Studio.")
+    lista = j.get("data", j) if isinstance(j, dict) else j
+    modelos = [m if isinstance(m, dict) else {"id": str(m)} for m in lista]
+
+    def es_tts(m):
+        i = str(m.get("id", "")).lower()
+        return "voxtral" in i and "realtime" not in i and ("tts" in i or m.get("task") == "text-to-speech")
+    cands = sorted((m for m in modelos if es_tts(m)),
+                   key=lambda m: (m.get("loaded") is False, m.get("task") != "text-to-speech",
+                                  "audio" not in str(m.get("id", "")).lower()))
+    if not cands:
+        ids = [str(m.get("id", "")) for m in modelos if m.get("id")]
+        if ids:
+            return ids[0]
+        raise RuntimeError("Unsloth no tiene ningún modelo cargado: carga Voxtral TTS en Unsloth Studio.")
+    m = cands[0]
+    if m.get("loaded") is False and cargar:
+        log("Cargando Voxtral en Unsloth Studio (unos segundos)...")
+        resp, _ = _http(url + "/v1/load", clave, {"model_path": m["id"]}, timeout=900)
+        texto = resp.decode("utf-8", "replace")
+        if "_deferred_error" in texto or '"detail"' in texto[:40]:
+            raise RuntimeError("Unsloth no pudo cargar Voxtral: " + texto[:300])
+    return m["id"]
 
 
 def voces_servidor(url, clave):
@@ -1301,7 +1300,7 @@ class SintVoxtral:
         """Voxtral servido por Unsloth Studio (/v1/audio/speech, OpenAI compatible)."""
         self.url = url
         try:
-            self.modelo = _modelo_api(self.url, self.clave)
+            self.modelo = _modelo_api(self.url, self.clave, self.log)
             if exigir_voxtral and "voxtral" not in self.modelo.lower() and not cargar_ajustes().get("vx_modelo"):
                 raise RuntimeError(f"el modelo cargado en Unsloth es '{self.modelo}', no Voxtral")
             self.props = campos_speech(self.url, self.clave)

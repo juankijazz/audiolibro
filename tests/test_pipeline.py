@@ -365,6 +365,53 @@ class Pipeline(unittest.TestCase):
             else:
                 os.environ["AUDIOLIBRO_CRISPASR_URL"] = old_env
 
+    def test_unsloth_elige_y_carga_el_voxtral_de_audiocpp(self):
+        """En Unsloth hay varios 'Voxtral': se elige el de audio.cpp (text-to-speech) y se carga si no lo esta."""
+        import http.server
+        cargas = []
+        modelos = {"object": "list", "data": [
+            {"id": "chris0173/Voxtral-4B-TTS-2603-GGUF", "loaded": False},
+            {"id": "handy-computer/Voxtral-Mini-4B-Realtime-2602-gguf", "loaded": False},
+            {"id": "audio-cpp/audio.cpp-gguf/Voxtral-4B-TTS-2603-GGUF", "loaded": False,
+             "task": "text-to-speech"},
+            {"id": "unsloth/Otro-LLM-GGUF", "loaded": True}]}
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _json(self, obj):
+                b = json.dumps(obj).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b)
+
+            def do_GET(self):
+                self._json(modelos)
+
+            def do_POST(self):
+                cargas.append(json.loads(self.rfile.read(int(self.headers["Content-Length"])))["model_path"])
+                self._json({"is_audio": True, "audio_type": "audiocpp_tts"})
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                old = os.environ.get("AUDIOLIBRO_DATOS")
+                os.environ["AUDIOLIBRO_DATOS"] = d
+                try:
+                    m = A._modelo_api(f"http://127.0.0.1:{srv.server_port}", "k", lambda *_: None)
+                finally:
+                    if old is None:
+                        os.environ.pop("AUDIOLIBRO_DATOS", None)
+                    else:
+                        os.environ["AUDIOLIBRO_DATOS"] = old
+            self.assertEqual(m, "audio-cpp/audio.cpp-gguf/Voxtral-4B-TTS-2603-GGUF")
+            self.assertEqual(cargas, [m])
+        finally:
+            srv.shutdown()
+
     def test_tope_memoria_motor(self):
         """El tope de memoria de crispasr deja sitio a frases normales pero no a una de 2000 tramas."""
         self.assertGreaterEqual(A.VX_MEM_GB, 4)
